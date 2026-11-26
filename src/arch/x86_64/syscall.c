@@ -84,10 +84,15 @@ NORETURN void enter_usermode(uint64_t entry_rip, uint64_t user_rsp)
         "pushq $0x202\n"
         "pushq $0x23\n"
         "pushq %1\n"
+        /* A fresh image starts with argc/argv/envp registers cleared, so a
+         * program entered this way (no exec vector) observes argc == 0. */
+        "xorl %%edi, %%edi\n"
+        "xorl %%esi, %%esi\n"
+        "xorl %%edx, %%edx\n"
         "iretq\n"
         :
         : "r"(user_rsp), "r"(entry_rip)
-        : "memory");
+        : "rdi", "rsi", "rdx", "memory");
 
     __builtin_unreachable();
 }
