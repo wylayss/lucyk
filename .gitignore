@@ -1,0 +1,19 @@
+# Build outputs & disk images
+build/
+*.o
+*.d
+*.elf
+*.bin
+*.iso
+*.img
+
+# Logs & temporary test artifacts
+serial.log
+*.log
+*.tmp
+
+# Editor & OS metadata
+.vscode/
+.idea/
+.DS_Store
+compile_commands.json
