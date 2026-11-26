@@ -318,12 +318,14 @@ bool bsd_proc_snapshot(int32_t pid, bool want_vspace, bsd_proc_info_t *out)
         }
 
         /* execve() and teardown swap or clear task->vspace under this same
-         * interrupt-masked section on the process's CPU, so the reference is
-         * taken on a live address space. */
-        if (want_vspace && proc->state == PROC_RUNNING &&
-            task->vspace != NULL) {
-            vspace_ref(task->vspace);
-            out->vspace = task->vspace;
+         * interrupt-masked section on the process's CPU. Read the vspace
+         * pointer once; vspace_ref() takes vspace_lock and increments the
+         * reference before vspace_destroy can drop it. */
+        vspace_t *vspace = task->vspace;
+
+        if (want_vspace && proc->state == PROC_RUNNING && vspace != NULL) {
+            vspace_ref(vspace);
+            out->vspace = vspace;
         }
     }
 

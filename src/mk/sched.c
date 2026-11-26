@@ -437,8 +437,15 @@ static void switch_to(thread_t *next)
     write_msr(IA32_FS_BASE_MSR, next->fs_base);
 
     /* FXSAVE64/FXRSTOR64 run inside switch_context, around the stack swap,
-     * so every thread resumes with exactly the FPU/SSE state it left with. */
-    switch_context(&prev->kstack_ctx, next->kstack_ctx, next->kstack_top,
+     * so every thread resumes with exactly the FPU/SSE state it left with.
+     * A NULL `prev` (a CPU with no current thread yet) saves its outgoing
+     * context into a scratch slot instead of dereferencing NULL; `old_fx` is
+     * already NULL in that case. */
+    static cpu_context_t *abandoned_ctx[MAX_CPUS];
+    cpu_context_t **save_ctx =
+        (prev != NULL) ? &prev->kstack_ctx : &abandoned_ctx[cpu];
+
+    switch_context(save_ctx, next->kstack_ctx, next->kstack_top,
                    (next_cr3 != prev_cr3) ? next_cr3 : 0,
                    (prev != NULL) ? prev->fxsave_area : NULL,
                    next->fxsave_area);

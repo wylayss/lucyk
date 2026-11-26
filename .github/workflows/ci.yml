@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   verify:
-    name: Build & verify (Kernel Stages A-D)
+    name: LucyK Kernel
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
