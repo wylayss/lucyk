@@ -14,10 +14,17 @@
 #include <types.h>
 #include <vspace.h>
 
-/* Each CPU owns one round-robin ring plus its own idle context. A thread is
+/* Each CPU owns one ring of threads plus its own idle context. A thread is
  * linked into exactly one ring and is only ever dispatched by that CPU, so two
  * CPUs can never run the same thread_t: a save/restore of the same context on
- * two cores is structurally impossible. */
+ * two cores is structurally impossible.
+ *
+ * Dispatch order is QoS first: the runnable thread with the highest
+ * effective_qos wins, and threads of one class rotate round-robin. Every time a
+ * runnable thread loses a dispatch to a higher class its qos_age grows; once
+ * it reaches its class limit it is dispatched for one quantum regardless of
+ * class, so DEFAULT and BACKGROUND work keeps a guaranteed share (at least one
+ * quantum every QOS_AGE_LIMIT_* + 1 dispatches) under interactive load. */
 typedef struct cpu_runqueue {
     spinlock_t lock;
     thread_t  *ring; /* Circular list of every thread owned by this CPU. */
@@ -39,6 +46,14 @@ static uint64_t reaped_count;
 static spinlock_t clock_lock;
 
 static volatile uint32_t reschedule_pending[MAX_CPUS];
+
+/* Dispatches a runnable thread may lose to higher classes before it is run
+ * regardless of class. INTERACTIVE is the top class and never ages. */
+#define QOS_AGE_LIMIT_DEFAULT    8U
+#define QOS_AGE_LIMIT_BACKGROUND 16U
+
+/* Leaf lock serialising base/inherited/effective QoS updates. */
+static spinlock_t qos_lock;
 
 /* Rotating start index for placement tie-breaks. Successive threads therefore
  * land on different CPUs even when every run queue is equally loaded. */
@@ -146,8 +161,44 @@ static bool ring_remove(cpu_runqueue_t *rq, thread_t *thread)
     return true;
 }
 
-/* Caller must hold rq->lock. */
-static thread_t *ring_pick_next(cpu_runqueue_t *rq, thread_t *after)
+static uint32_t qos_age_limit(uint8_t qos)
+{
+    switch (qos) {
+    case THREAD_QOS_BACKGROUND:
+        return QOS_AGE_LIMIT_BACKGROUND;
+    case THREAD_QOS_DEFAULT:
+        return QOS_AGE_LIMIT_DEFAULT;
+    default:
+        return 0;
+    }
+}
+
+static uint8_t qos_of(const thread_t *thread)
+{
+    return __atomic_load_n(&thread->effective_qos, __ATOMIC_RELAXED);
+}
+
+/* Caller must hold rq->lock. `current` competes only when current_eligible
+ * (a preemption check), and then only while it is still RUNNING. */
+static bool pick_candidate(const cpu_runqueue_t *rq, const thread_t *thread,
+                           const thread_t *current, bool current_eligible)
+{
+    if (is_idle_thread(thread) || thread == rq->idle) {
+        return false;
+    }
+    if (thread == current) {
+        return current_eligible && thread->state == THREAD_RUNNING;
+    }
+    return thread->state == THREAD_READY;
+}
+
+/* Caller must hold rq->lock. Returns the thread that should own the CPU next:
+ * the first aged thread, otherwise the first highest-QoS candidate in ring
+ * order starting after `after` (so equal classes rotate and `current`, which
+ * the walk visits last, only keeps the CPU when nothing better or equal is
+ * runnable). Updates the aging credits of every candidate that lost. */
+static thread_t *ring_pick_next_qos(cpu_runqueue_t *rq, thread_t *after,
+                                    thread_t *current, bool current_eligible)
 {
     if (rq->ring == NULL || rq->count == 0) {
         return NULL;
@@ -162,17 +213,103 @@ static thread_t *ring_pick_next(cpu_runqueue_t *rq, thread_t *after)
         start = after->sched_next;
     }
 
+    thread_t *best = NULL;
+    thread_t *aged = NULL;
     thread_t *cursor = start;
 
     do {
-        if (!is_idle_thread(cursor) && cursor != rq->idle &&
-            cursor->state == THREAD_READY) {
-            return cursor;
+        if (pick_candidate(rq, cursor, current, current_eligible)) {
+            uint8_t qos = qos_of(cursor);
+            uint32_t limit = qos_age_limit(qos);
+
+            if (aged == NULL && limit != 0 && cursor->qos_age >= limit) {
+                aged = cursor;
+            }
+            if (best == NULL || qos > qos_of(best)) {
+                best = cursor;
+            }
         }
         cursor = cursor->sched_next;
     } while (cursor != start);
 
-    return NULL;
+    if (best == NULL) {
+        return NULL;
+    }
+
+    thread_t *chosen = (aged != NULL) ? aged : best;
+    uint8_t best_qos = qos_of(best);
+
+    cursor = start;
+    do {
+        if (cursor != chosen &&
+            pick_candidate(rq, cursor, current, current_eligible) &&
+            qos_of(cursor) < best_qos && cursor->qos_age < 0xFFFFFFFFU) {
+            cursor->qos_age++;
+        }
+        cursor = cursor->sched_next;
+    } while (cursor != start);
+
+    chosen->qos_age = 0;
+    return chosen;
+}
+
+/* Caller must hold rq->lock. Next runnable thread other than the caller. */
+static thread_t *ring_pick_next(cpu_runqueue_t *rq, thread_t *after)
+{
+    return ring_pick_next_qos(rq, after, after, false);
+}
+
+static void qos_recompute_locked(thread_t *thread)
+{
+    uint8_t effective = thread->base_qos;
+
+    if (thread->inherited_qos != THREAD_QOS_NONE &&
+        thread->inherited_qos > effective) {
+        effective = thread->inherited_qos;
+    }
+    __atomic_store_n(&thread->effective_qos, effective, __ATOMIC_RELAXED);
+}
+
+void sched_qos_set_base(thread_t *thread, uint8_t qos)
+{
+    if (thread == NULL || qos >= THREAD_QOS_COUNT) {
+        return;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&qos_lock);
+    thread->base_qos = qos;
+    qos_recompute_locked(thread);
+    spin_unlock_irqrestore(&qos_lock, flags);
+}
+
+void sched_qos_inherit(thread_t *server, const thread_t *client)
+{
+    if (server == NULL || client == NULL || server == client) {
+        return;
+    }
+
+    uint8_t lent = qos_of(client);
+    uint64_t flags = spin_lock_irqsave(&qos_lock);
+
+    if (server->inherited_qos == THREAD_QOS_NONE ||
+        lent > server->inherited_qos) {
+        server->inherited_qos = lent;
+    }
+    qos_recompute_locked(server);
+
+    spin_unlock_irqrestore(&qos_lock, flags);
+}
+
+void sched_qos_restore(thread_t *server)
+{
+    if (server == NULL) {
+        return;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&qos_lock);
+    server->inherited_qos = THREAD_QOS_NONE;
+    qos_recompute_locked(server);
+    spin_unlock_irqrestore(&qos_lock, flags);
 }
 
 static void reap_dead_threads(void)
@@ -299,8 +436,12 @@ static void switch_to(thread_t *next)
     }
     write_msr(IA32_FS_BASE_MSR, next->fs_base);
 
+    /* FXSAVE64/FXRSTOR64 run inside switch_context, around the stack swap,
+     * so every thread resumes with exactly the FPU/SSE state it left with. */
     switch_context(&prev->kstack_ctx, next->kstack_ctx, next->kstack_top,
-                   (next_cr3 != prev_cr3) ? next_cr3 : 0);
+                   (next_cr3 != prev_cr3) ? next_cr3 : 0,
+                   (prev != NULL) ? prev->fxsave_area : NULL,
+                   next->fxsave_area);
 
     /* `prev` may have been reclaimed while switched out, so the outgoing
      * address space is taken from the snapshot above, never from prev. */
@@ -326,6 +467,7 @@ void sched_init(void)
 
     spinlock_init(&reap_lock);
     spinlock_init(&clock_lock);
+    spinlock_init(&qos_lock);
 
     memset(&boot_task, 0, sizeof(boot_task));
     memset(&boot_thread, 0, sizeof(boot_thread));
@@ -343,6 +485,10 @@ void sched_init(void)
     boot_thread.tid = 0;
     boot_thread.owner_task = &boot_task;
     boot_thread.cpu_index = 0;
+    boot_thread.base_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    boot_thread.effective_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    boot_thread.inherited_qos = (uint8_t)THREAD_QOS_NONE;
+    thread_fpu_init(&boot_thread);
 
     /* The idle context gets the same guarded five-page slot as every worker.
      * kernel_main switches onto it immediately after sched_init(). */
@@ -419,6 +565,10 @@ void sched_register_cpu(uint32_t cpu_index)
     idle->sched_next = idle;
     idle->entry = sched_idle_task;
     idle->arg = NULL;
+    idle->base_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    idle->effective_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    idle->inherited_qos = (uint8_t)THREAD_QOS_NONE;
+    thread_fpu_init(idle);
 
     cpu_context_t *ctx =
         (cpu_context_t *)(uintptr_t)(idle->kstack_top - sizeof(cpu_context_t));
@@ -462,7 +612,8 @@ NORETURN void sched_enter_idle(void)
     cpu_context_t *abandoned = NULL;
 
     idle->state = THREAD_RUNNING;
-    switch_context(&abandoned, idle->kstack_ctx, idle->kstack_top, 0);
+    switch_context(&abandoned, idle->kstack_ctx, idle->kstack_top, 0, NULL,
+                   idle->fxsave_area);
 
     cpu_halt();
     __builtin_unreachable();
@@ -471,6 +622,21 @@ NORETURN void sched_enter_idle(void)
 static thread_t *select_next_local(cpu_runqueue_t *rq, thread_t *current)
 {
     thread_t *next = ring_pick_next(rq, current);
+
+    if (next == NULL) {
+        next = rq->idle;
+    }
+
+    return next;
+}
+
+/* Preemption variant: the running worker competes with the ready threads, so
+ * it keeps the CPU against lower classes and rotates within its own. */
+static thread_t *select_next_preempt(cpu_runqueue_t *rq, thread_t *current)
+{
+    bool eligible = current != NULL && !is_idle_thread(current) &&
+                    current->state == THREAD_RUNNING;
+    thread_t *next = ring_pick_next_qos(rq, current, current, eligible);
 
     if (next == NULL) {
         next = rq->idle;
@@ -602,6 +768,14 @@ void sched_handoff(thread_t *next)
     }
 
     uint64_t flags = irq_save();
+    thread_t *self = sched_current_thread();
+
+    /* Priority inheritance: a caller parked waiting for next's reply lends
+     * next its QoS until the reply (or the caller's teardown) restores it. */
+    if (self != NULL && self->state == THREAD_BLOCKED_REPLY &&
+        self->reply_target == next) {
+        sched_qos_inherit(next, self);
+    }
 
     if (next->cpu_index == this_cpu_index()) {
         switch_to(next);
@@ -760,7 +934,7 @@ void sched_tick(void)
                         current->state != THREAD_RUNNING || (now & 1ULL) == 0;
 
     if (needs_switch) {
-        next = select_next_local(rq, current);
+        next = select_next_preempt(rq, current);
     }
 
     spin_unlock_irqrestore(&rq->lock, flags);
@@ -772,7 +946,8 @@ void sched_tick(void)
 
 void sched_start(void)
 {
-    klog(KLOG_INFO, "scheduler: per-CPU round-robin, 1000 Hz preemption");
+    klog(KLOG_INFO, "scheduler: per-CPU QoS (interactive/default/background, "
+         "aged), 1000 Hz preemption, FXSAVE64 FPU/SSE context switch");
     __asm__ volatile("sti" : : : "memory");
 }
 
