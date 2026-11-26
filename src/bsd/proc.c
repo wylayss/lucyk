@@ -3,6 +3,7 @@
 #include <bsd/proc.h>
 #include <bsd/syscall_bsd.h>
 #include <bsd/vfs.h>
+#include <cap.h>
 #include <elf.h>
 #include <io.h>
 #include <kalloc.h>
@@ -272,6 +273,97 @@ bsd_proc_t *bsd_proc_lookup(int32_t pid)
     irq_restore(flags);
 
     return proc;
+}
+
+bool bsd_proc_snapshot(int32_t pid, bool want_vspace, bsd_proc_info_t *out)
+{
+    if (out == NULL) {
+        return false;
+    }
+
+    memset(out, 0, sizeof(*out));
+
+    uint64_t flags = irq_save();
+    bsd_proc_t *proc = lookup_locked(pid);
+
+    if (proc == NULL) {
+        irq_restore(flags);
+        return false;
+    }
+
+    out->pid = proc->pid;
+    out->ppid = proc->ppid;
+    out->pgid = proc->pgid;
+    out->uid = proc->uid;
+    out->gid = proc->gid;
+    out->state = proc->state;
+    out->pending_signals = proc->pending_signals;
+    out->signal_mask = proc->signal_mask;
+    out->brk_base = proc->brk_base;
+    out->brk_current = proc->brk_current;
+    memcpy(out->mmap_regions, proc->mmap_regions, sizeof(out->mmap_regions));
+    memcpy(out->comm, proc->comm, sizeof(out->comm));
+    out->comm[BSD_COMM_LEN - 1] = '\0';
+
+    task_t *task = proc->mk_task;
+
+    if (task != NULL) {
+        out->task_id = task->id;
+        out->threads = task->thread_count;
+
+        thread_t *first = task->threads;
+        if (first != NULL) {
+            out->base_qos = first->base_qos;
+            out->effective_qos = first->effective_qos;
+        }
+
+        /* execve() and teardown swap or clear task->vspace under this same
+         * interrupt-masked section on the process's CPU, so the reference is
+         * taken on a live address space. */
+        if (want_vspace && proc->state == PROC_RUNNING &&
+            task->vspace != NULL) {
+            vspace_ref(task->vspace);
+            out->vspace = task->vspace;
+        }
+    }
+
+    irq_restore(flags);
+    return true;
+}
+
+int32_t bsd_proc_next_pid(int32_t after)
+{
+    int32_t found = 0;
+    uint64_t flags = irq_save();
+
+    for (int32_t pid = (after < 0 ? 0 : after) + 1; pid < BSD_MAX_PROCS;
+         pid++) {
+        if (proc_table[pid].state != PROC_UNUSED) {
+            found = pid;
+            break;
+        }
+    }
+
+    irq_restore(flags);
+    return found;
+}
+
+sys_status_t bsd_proc_install_boot_caps(bsd_proc_t *proc)
+{
+    if (proc == NULL || proc->mk_task == NULL || proc->mk_task->caps == NULL) {
+        return BSD_ERR(BSD_EINVAL);
+    }
+
+    uint32_t installed = 0;
+    sys_status_t status = cap_boot_install(proc->mk_task->caps, &installed);
+
+    if (status != SYS_OK) {
+        return BSD_ERR(BSD_EBUSY);
+    }
+
+    klog(KLOG_INFO, "bsd: PID %d received %lu boot capabilit%s",
+         (int)proc->pid, (uint64_t)installed, installed == 1 ? "y" : "ies");
+    return SYS_OK;
 }
 
 bsd_proc_t *bsd_proc_current(void)
@@ -940,10 +1032,13 @@ sys_status_t bsd_proc_arch_prctl(int32_t code, uint64_t addr,
 #define BSD_EXEC_MAX_IMAGE (16ULL * 1024ULL * 1024ULL)
 #define BSD_EXEC_STACK_LOW (ELF_USER_STACK_TOP - ELF_USER_STACK_SIZE)
 
+/* Heap-allocated (about 8.5 KiB): far too large for a 16 KiB kernel stack. */
 typedef struct bsd_exec_args {
     char path[BSD_PATH_MAX];
     char strings[BSD_MAX_EXEC_ARGS][BSD_PATH_MAX];
+    char env[BSD_MAX_EXEC_ARGS][BSD_PATH_MAX];
     int argc;
+    int envc;
 } bsd_exec_args_t;
 
 typedef struct bsd_fork_start {
@@ -971,15 +1066,20 @@ static sys_status_t copy_user_string(uint64_t user_addr, char *dst,
     return BSD_ERR(length_error);
 }
 
-/* Non-NULL envp vectors are bounds-checked through copy_from_user but the
- * Phase 3 exec ABI still passes an empty environment to the new image. */
-static sys_status_t validate_exec_envp(uint64_t uenvp)
+/* Copies a NULL-terminated user vector of at most BSD_MAX_EXEC_ARGS strings
+ * into out[], charging every string (with its NUL) against *payload, which
+ * is bounded by BSD_ARG_MAX across argv and envp together. A NULL vector is
+ * empty. */
+static sys_status_t copy_exec_vector(uint64_t uvec,
+                                     char out[BSD_MAX_EXEC_ARGS][BSD_PATH_MAX],
+                                     int *count_out, size_t *payload)
 {
-    if (uenvp == 0) {
+    *count_out = 0;
+
+    if (uvec == 0) {
         return SYS_OK;
     }
 
-    char scratch[BSD_PATH_MAX];
     int index = 0;
 
     for (; index < BSD_MAX_EXEC_ARGS; index++) {
@@ -987,37 +1087,48 @@ static sys_status_t validate_exec_envp(uint64_t uenvp)
 
         if (copy_from_user(
                 &pointer,
-                (const void *)(uintptr_t)(uenvp +
+                (const void *)(uintptr_t)(uvec +
                     (uint64_t)index * sizeof(uint64_t)),
                 sizeof(uint64_t)) != SYS_OK) {
             return BSD_ERR(BSD_EFAULT);
         }
         if (pointer == 0) {
+            *count_out = index;
             return SYS_OK;
         }
 
         sys_status_t status =
-            copy_user_string(pointer, scratch, sizeof(scratch), BSD_E2BIG);
+            copy_user_string(pointer, out[index], BSD_PATH_MAX, BSD_E2BIG);
         if (status != SYS_OK) {
             return status;
         }
+
+        size_t length = strlen(out[index]) + 1;
+        if (length > BSD_ARG_MAX - *payload) {
+            return BSD_ERR(BSD_E2BIG);
+        }
+        *payload += length;
     }
 
     uint64_t terminator = 0;
 
     if (copy_from_user(
             &terminator,
-            (const void *)(uintptr_t)(uenvp +
+            (const void *)(uintptr_t)(uvec +
                 (uint64_t)BSD_MAX_EXEC_ARGS * sizeof(uint64_t)),
             sizeof(uint64_t)) != SYS_OK) {
         return BSD_ERR(BSD_EFAULT);
     }
+    if (terminator != 0) {
+        return BSD_ERR(BSD_E2BIG);
+    }
 
-    return terminator == 0 ? SYS_OK : BSD_ERR(BSD_E2BIG);
+    *count_out = index;
+    return SYS_OK;
 }
 
-/* Copies the path, bounded argv strings and validates a non-NULL envp before
- * the address space is replaced. */
+/* Copies the path and the bounded argv and envp string arrays from the
+ * caller's address space before that address space is replaced. */
 static sys_status_t copy_exec_arguments(uint64_t upath, uint64_t uargv,
                                         uint64_t uenvp, bsd_exec_args_t *args)
 {
@@ -1032,54 +1143,11 @@ static sys_status_t copy_exec_arguments(uint64_t upath, uint64_t uargv,
         return BSD_ERR(BSD_ENOENT);
     }
 
-    args->argc = 0;
     size_t payload = 0;
 
-    if (uargv != 0) {
-        int index = 0;
-
-        for (; index < BSD_MAX_EXEC_ARGS; index++) {
-            uint64_t arg_ptr = 0;
-
-            if (copy_from_user(
-                    &arg_ptr,
-                    (const void *)(uintptr_t)(uargv +
-                        (uint64_t)index * sizeof(uint64_t)),
-                    sizeof(uint64_t)) != SYS_OK) {
-                return BSD_ERR(BSD_EFAULT);
-            }
-            if (arg_ptr == 0) {
-                break;
-            }
-
-            status = copy_user_string(arg_ptr, args->strings[index],
-                                      BSD_PATH_MAX, BSD_E2BIG);
-            if (status != SYS_OK) {
-                return status;
-            }
-
-            size_t length = strlen(args->strings[index]) + 1;
-            if (length > BSD_ARG_MAX - payload) {
-                return BSD_ERR(BSD_E2BIG);
-            }
-            payload += length;
-            args->argc++;
-        }
-
-        if (index == BSD_MAX_EXEC_ARGS) {
-            uint64_t terminator = 0;
-
-            if (copy_from_user(
-                    &terminator,
-                    (const void *)(uintptr_t)(uargv +
-                        (uint64_t)BSD_MAX_EXEC_ARGS * sizeof(uint64_t)),
-                    sizeof(uint64_t)) != SYS_OK) {
-                return BSD_ERR(BSD_EFAULT);
-            }
-            if (terminator != 0) {
-                return BSD_ERR(BSD_E2BIG);
-            }
-        }
+    status = copy_exec_vector(uargv, args->strings, &args->argc, &payload);
+    if (status != SYS_OK) {
+        return status;
     }
 
     if (args->argc == 0) {
@@ -1087,9 +1155,89 @@ static sys_status_t copy_exec_arguments(uint64_t upath, uint64_t uargv,
 
         memcpy(args->strings[0], args->path, length + 1);
         args->argc = 1;
+        payload += length + 1;
     }
 
-    return validate_exec_envp(uenvp);
+    return copy_exec_vector(uenvp, args->env, &args->envc, &payload);
+}
+
+static sys_status_t write_user_vspace(vspace_t *vspace, vaddr_t dst,
+                                      const void *src, size_t len);
+
+/* Lays out the System V initial process stack in new_vspace below
+ * ELF_USER_STACK_TOP:
+ *
+ *   base -> argc | argv[0..argc-1] | NULL | envp[0..envc-1] | NULL
+ *           ... padding ... | envp strings | argv strings | (top)
+ *
+ * base is 16-byte aligned, which is what musl's _start and Rust's runtime
+ * expect at process entry (rsp == base). */
+static sys_status_t build_exec_stack(vspace_t *new_vspace,
+                                     const bsd_exec_args_t *args,
+                                     vaddr_t *base_out)
+{
+    uint64_t arg_addresses[BSD_MAX_EXEC_ARGS];
+    uint64_t env_addresses[BSD_MAX_EXEC_ARGS];
+    vaddr_t top = ELF_USER_STACK_TOP;
+    int argc = args->argc;
+    int envc = args->envc;
+
+    for (int i = argc - 1; i >= 0; i--) {
+        size_t length = strlen(args->strings[i]) + 1;
+
+        if ((vaddr_t)length > top - BSD_EXEC_STACK_LOW) {
+            return BSD_ERR(BSD_E2BIG);
+        }
+        top -= (vaddr_t)length;
+        if (write_user_vspace(new_vspace, top, args->strings[i], length) !=
+            SYS_OK) {
+            return BSD_ERR(BSD_EFAULT);
+        }
+        arg_addresses[i] = (uint64_t)top;
+    }
+
+    for (int i = envc - 1; i >= 0; i--) {
+        size_t length = strlen(args->env[i]) + 1;
+
+        if ((vaddr_t)length > top - BSD_EXEC_STACK_LOW) {
+            return BSD_ERR(BSD_E2BIG);
+        }
+        top -= (vaddr_t)length;
+        if (write_user_vspace(new_vspace, top, args->env[i], length) !=
+            SYS_OK) {
+            return BSD_ERR(BSD_EFAULT);
+        }
+        env_addresses[i] = (uint64_t)top;
+    }
+
+    top &= ~15ULL;
+
+    size_t words = 1U + (size_t)argc + 1U + (size_t)envc + 1U;
+    if ((vaddr_t)(words * sizeof(uint64_t)) + 16U > top - BSD_EXEC_STACK_LOW) {
+        return BSD_ERR(BSD_E2BIG);
+    }
+
+    vaddr_t base = (top - (vaddr_t)(words * sizeof(uint64_t))) & ~15ULL;
+    uint64_t stack_words[1 + BSD_MAX_EXEC_ARGS + 1 + BSD_MAX_EXEC_ARGS + 1];
+    size_t w = 0;
+
+    stack_words[w++] = (uint64_t)argc;
+    for (int i = 0; i < argc; i++) {
+        stack_words[w++] = arg_addresses[i];
+    }
+    stack_words[w++] = 0;
+    for (int i = 0; i < envc; i++) {
+        stack_words[w++] = env_addresses[i];
+    }
+    stack_words[w++] = 0;
+
+    if (write_user_vspace(new_vspace, base, stack_words,
+                          words * sizeof(uint64_t)) != SYS_OK) {
+        return BSD_ERR(BSD_EFAULT);
+    }
+
+    *base_out = base;
+    return SYS_OK;
 }
 
 /* Writes into a not-current vspace by translating each page through the HHDM. */
@@ -1292,9 +1440,10 @@ int32_t bsd_proc_fork(syscall_frame_t *parent_frame)
     start->frame = *parent_frame;
     start->frame.rax = 0;
 
-    /* The microkernel publishes the inherited TLS base before the thread can
-     * be dequeued by any CPU. */
-    thread_t *child_thread = thread_create_with_fs_base(
+    /* The microkernel publishes the inherited TLS base, and a copy of this
+     * thread's live FPU/SSE registers, before the thread can be dequeued by
+     * any CPU. */
+    thread_t *child_thread = thread_create_inheriting(
         child_task, bsd_fork_child_entry, start, snapshot_fs_base);
 
     if (child_thread == NULL) {
@@ -1313,6 +1462,9 @@ fail:
     return (int32_t)BSD_ERR(BSD_ENOMEM);
 }
 
+static sys_status_t exec_image(bsd_proc_t *proc, syscall_frame_t *frame,
+                               const bsd_exec_args_t *args);
+
 sys_status_t bsd_proc_execve(syscall_frame_t *frame, const char *upath,
                              char *const uargv[], char *const uenvp[])
 {
@@ -1322,19 +1474,31 @@ sys_status_t bsd_proc_execve(syscall_frame_t *frame, const char *upath,
         return BSD_ERR(BSD_EINVAL);
     }
 
-    bsd_exec_args_t args;
-    memset(&args, 0, sizeof(args));
+    bsd_exec_args_t *args = (bsd_exec_args_t *)kalloc(sizeof(*args));
+    if (args == NULL) {
+        return BSD_ERR(BSD_ENOMEM);
+    }
+    memset(args, 0, sizeof(*args));
 
     sys_status_t status =
         copy_exec_arguments((uint64_t)(uintptr_t)upath,
                             (uint64_t)(uintptr_t)uargv,
-                            (uint64_t)(uintptr_t)uenvp, &args);
-    if (status != SYS_OK) {
-        return status;
+                            (uint64_t)(uintptr_t)uenvp, args);
+    if (status == SYS_OK) {
+        status = exec_image(proc, frame, args);
     }
 
+    kfree(args);
+    return status;
+}
+
+/* Loads args->path over the calling process. On failure the caller's address
+ * space is untouched. */
+static sys_status_t exec_image(bsd_proc_t *proc, syscall_frame_t *frame,
+                               const bsd_exec_args_t *args)
+{
     file_t *file = NULL;
-    status = vfs_open(proc, args.path, BSD_O_RDONLY, 0, &file);
+    sys_status_t status = vfs_open(proc, args->path, BSD_O_RDONLY, 0, &file);
     if (status != SYS_OK) {
         return status;
     }
@@ -1401,51 +1565,14 @@ sys_status_t bsd_proc_execve(syscall_frame_t *frame, const char *upath,
         return BSD_ERR(BSD_ENOEXEC);
     }
 
-    uint64_t arg_addresses[BSD_MAX_EXEC_ARGS];
-    vaddr_t top = ELF_USER_STACK_TOP;
-    int argc = args.argc;
+    vaddr_t base = 0;
 
-    for (int i = 0; i < argc; i++) {
-        size_t length = strlen(args.strings[i]) + 1;
-
-        if ((vaddr_t)length > top - BSD_EXEC_STACK_LOW) {
-            status = BSD_ERR(BSD_E2BIG);
-            goto fail_vspace;
-        }
-
-        top -= (vaddr_t)length;
-        if (write_user_vspace(new_vspace, top, args.strings[i], length) !=
-            SYS_OK) {
-            status = BSD_ERR(BSD_EFAULT);
-            goto fail_vspace;
-        }
-        arg_addresses[i] = (uint64_t)top;
-    }
-
-    top &= ~15ULL;
-
-    size_t words = 1U + (size_t)(argc + 1) + 1U;
-    if ((vaddr_t)(words * sizeof(uint64_t)) > top - BSD_EXEC_STACK_LOW) {
-        status = BSD_ERR(BSD_E2BIG);
+    status = build_exec_stack(new_vspace, args, &base);
+    if (status != SYS_OK) {
         goto fail_vspace;
     }
 
-    vaddr_t base = (top - (vaddr_t)(words * sizeof(uint64_t))) & ~15ULL;
-    uint64_t stack_words[1 + BSD_MAX_EXEC_ARGS + 1 + 1];
-
-    stack_words[0] = (uint64_t)argc;
-    for (int i = 0; i < argc; i++) {
-        stack_words[1 + i] = arg_addresses[i];
-    }
-    stack_words[1 + argc] = 0;
-    stack_words[2 + argc] = 0;
-
-    if (write_user_vspace(new_vspace, base, stack_words,
-                          words * sizeof(uint64_t)) != SYS_OK) {
-        status = BSD_ERR(BSD_EFAULT);
-        goto fail_vspace;
-    }
-
+    int argc = args->argc;
     vaddr_t argv_user = base + sizeof(uint64_t);
     vaddr_t envp_user =
         base + (vaddr_t)((1U + (size_t)(argc + 1)) * sizeof(uint64_t));
@@ -1487,7 +1614,11 @@ sys_status_t bsd_proc_execve(syscall_frame_t *frame, const char *upath,
                          : "memory");
     }
 
-    set_exec_comm(proc, args.path);
+    /* The new image starts from the clean FPU/SSE state (FCW 0x037F, MXCSR
+     * 0x1F80, XMM0-15 zero) rather than inheriting the old program's. */
+    thread_fpu_reset_current();
+
+    set_exec_comm(proc, args->path);
 
     frame->rcx = entry;
     frame->rsp = (uint64_t)base;
