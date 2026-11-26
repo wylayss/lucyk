@@ -135,3 +135,30 @@ Before completing any phase or task:
 1. Build cleanly with zero warnings (`-Wall -Wextra -Werror`).
 2. Verify linker alignment (`4096` bytes) in `linker.ld` with distinct `.text` (`RX`), `.rodata` (`R`), and `.data`/`.bss` (`RW`) segments.
 3. Boot `build/os.iso` in QEMU with `-serial stdio -no-reboot -no-shutdown` and confirm expected `[INFO]` serial output with zero unhandled exceptions or triple faults.
+
+---
+
+## 8. Git Workflow & Branch Discipline
+
+Strict Git repository hygiene applies to every AI coding agent working on `wylayss/lucyk` (and to human contributors). See also [`CONTRIBUTING.md`](CONTRIBUTING.md) §5; this section is the authoritative rule set.
+
+1. **Never Edit Directly on `main`:**
+   - Always check `git branch --show-current` before modifying any file.
+   - If the current branch is `main`, create and switch to a dedicated topic branch first: `feat/<topic>`, `fix/<topic>`, `audit/<topic>`, or `docs/<topic>`.
+   - Never edit, stage, or commit on `main`.
+
+2. **Verification Gate Before Commit:**
+   - Never create a commit until `./scripts/verify.sh` (`make verify`) passes cleanly.
+   - "Cleanly" means: `-Wall -Wextra -Werror` with zero warnings; architectural boundary/hygiene scan; QEMU `-smp 1` and `-cpu max -smp 4` boot checks reaching the `lucyk#` prompt with Stage A–D self-tests and 0 leaked frames; and `e2fsck -fn build/disk.img`.
+   - A failing or skipped gate blocks the commit; do not commit with a known-red verification.
+
+3. **Atomic Commits & Subsystem Prefixes:**
+   - Use conventional commit messages scoped to the subsystem: `mk:`, `arch:`, `io:`, `bsd:`, `user:`, `docs:`, `chore:`.
+   - One logical change per commit; keep commits atomic and focused.
+   - Any syscall, ABI, or locking-contract change must update `docs/*.md` in the same branch (see §4).
+   - Never stage build outputs: `build/`, `*.o`, `*.iso`, `*.img`. Verify with `git status` before staging.
+
+4. **Forbidden Git Operations:**
+   - Never run `git push --force` (or `git push --force-with-lease` over shared review history).
+   - Never run `git reset --hard` over unbacked local edits; back up or stash uncommitted work first.
+   - Never auto-merge into `main`. Merging into `main` and tagging releases are reserved for human maintainers after review.

@@ -39,3 +39,23 @@ All four gates must pass: clean build (0 warnings), boundary/hygiene scan, headl
 boots on `-smp 1` and `-cpu max -smp 4` (Stage A–D self-tests, 0 leaked frames, `lucyk#`
 prompt), and `e2fsck` integrity. Never finish with a failing or skipped gate. If you touch
 an ABI/syscall, update the corresponding document under `docs/`.
+
+## Git repository hygiene (mandatory)
+
+Summary of [`AGENT.md`](AGENT.md) §8 (Git Workflow & Branch Discipline) — `AGENT.md` remains
+the single source of truth; this is not a replacement for the full spec. Every AI coding
+agent working on `wylayss/lucyk` must:
+
+- **never work on main — checkout feat/*, fix/*, audit/*, or docs/* first.** Run
+  `git branch --show-current` before modifying any file; if it prints `main`, create and
+  switch to a dedicated topic branch (`feat/<topic>`, `fix/<topic>`, `audit/<topic>`, or
+  `docs/<topic>`).
+- **Run `make verify` (`./scripts/verify.sh`) before committing.** Never create a commit
+  until all four gates pass cleanly.
+- **Use subsystem commit prefixes:** conventional commits scoped `mk:`, `arch:`, `io:`,
+  `bsd:`, `user:`, `docs:`, or `chore:`. Syscall/ABI/locking-contract changes update
+  `docs/*.md` in the same branch. Never stage build outputs (`build/`, `*.o`, `*.iso`,
+  `*.img`).
+- **Never auto-merge to `main`.** Merging into `main` and tagging releases are reserved for
+  human maintainers after review. Never run `git push --force` or `git reset --hard` over
+  unbacked local edits.
