@@ -269,7 +269,49 @@ documentation change without a corresponding functional reason.
 
 ---
 
-## 7. Reporting Bugs & Getting Help
+## 7. AI-Assisted Contributions
+
+AI coding agents are welcome, but **you — the human contributor — remain fully responsible
+for every committed line**, regardless of which tool produced it. The project ships
+repo-local agent entrypoints that all point back to [`AGENT.md`](AGENT.md) as the single
+source of truth:
+
+| Tool | Entrypoint |
+| :--- | :--- |
+| Codex / Roo Code / OpenCode | [`AGENTS.md`](AGENTS.md) |
+| Claude Code | [`CLAUDE.md`](CLAUDE.md) |
+| GitHub Copilot | [`.github/copilot-instructions.md`](.github/copilot-instructions.md) |
+| Cursor | [`.cursor/rules/lucyk.mdc`](.cursor/rules/lucyk.mdc) |
+
+If your agent is not picking up the rules, point it at `AGENT.md` and the files in `docs/`
+before it edits anything.
+
+**Requirements for AI-assisted pull requests:**
+
+1. **Disclose the tooling.** State in the PR description which agent/model (and version)
+   was used, and which parts of the change it produced. If AI was not used, say so.
+2. **Manually audit every generated line.** No blind AI dumps. Review the diff line by
+   line, with special attention to:
+   - `copy_from_user()` / `copy_to_user()` bounds and error handling (never a direct Ring 3
+     dereference in Ring 0),
+   - spinlock acquisition/release pairing and the global lock hierarchy
+     (`file -> ext2 -> blk`, `sched/cap -> heap -> vspace -> PMM`),
+   - page-table flags and `W^X` (no writable **and** executable mapping),
+   - capability rights checks and `sys_status_t` error paths.
+3. **Prove it builds and boots.** Run `./scripts/verify.sh` (or `make verify`) and attach
+   the passing result. All four gates must be green: clean build with 0 warnings, boundary
+   and hygiene scan, headless QEMU boots on `-smp 1` and `-cpu max -smp 4` with Stage A–D
+   self-tests and 0 leaked frames, and `e2fsck` integrity.
+4. **Do not let an agent weaken the guardrails.** Reject any AI change that edits the
+   `Makefile` flags, the linker scripts, the GDT selector ordering, the verification
+   script, or this repository's boundary rules, unless that change is the explicit purpose
+   of an approved PR.
+
+An AI-assisted PR that has not been manually reviewed and verified will be closed.
+
+---
+
+## 8. Reporting Bugs & Getting Help
 
 - Reproducible faults, panics, or build failures → the
   [`bug_report`](.github/ISSUE_TEMPLATE/bug_report.md) template (include the full COM1

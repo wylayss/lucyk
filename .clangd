@@ -1,0 +1,47 @@
+# Freestanding LSP configuration for LucyK.
+#
+# Mirrors the kernel CFLAGS in the Makefile so editor/agent diagnostics use the
+# same freestanding model as the real build (`make`). CFLAGS in the Makefile
+# use no -D defines, so none are added here.
+#
+# `-nostdinc` is deliberate: it stops clangd from resolving host libc headers
+# under /usr/include. The clang builtin headers (stdint.h, stddef.h, stdarg.h,
+# ...) are re-added explicitly via `-isystem`; the Makefile computes that path
+# at build time with `$(CC) -print-resource-dir`, which a static config cannot
+# do. The paths below cover common installations; nonexistent include
+# directories are ignored by clang. Add your clang version if <stdint.h> is not
+# found.
+CompileFlags:
+  Compiler: clang
+  Add:
+    - -std=c11
+    - -ffreestanding
+    - -nostdlib
+    - -nostdinc
+    - -fno-stack-protector
+    - -fno-builtin
+    - -fno-pic
+    - -fno-pie
+    - -mcmodel=kernel
+    - -mno-red-zone
+    - -mno-mmx
+    - -mno-sse
+    - -mno-sse2
+    - -mno-80387
+    - -O2
+    - -Wall
+    - -Wextra
+    - -Werror
+    - -Isrc/include
+    - -Ibuild/limine
+    - -Iuser
+    - -isystem
+    - /usr/lib/llvm-21/lib/clang/21/include
+    - -isystem
+    - /usr/lib/llvm-20/lib/clang/20/include
+    - -isystem
+    - /usr/lib/llvm-19/lib/clang/19/include
+    - -isystem
+    - /usr/lib/llvm-18/lib/clang/18/include
+    - -isystem
+    - /usr/lib/clang/21/include

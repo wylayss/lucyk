@@ -15,15 +15,21 @@ Keep the diff focused on one logical change. Fill in the summary and tick every 
 <!-- Paste the relevant [INFO]/self-test lines or panic output below. -->
 
 ```text
-$ make clean && make
-<build output tail — must show 0 warnings>
+$ make verify      # or: ./scripts/verify.sh
+<output tail — all four gates must report PASS>
 
-$ make run-smp4
-<serial output tail — self-tests must report 0 leaked frames>
+# Equivalent individual checks:
+$ make clean && make      # 0 warnings
+$ make run-smp1           # -smp 1
+$ make run-smp4           # -cpu max -smp 4
 ```
 
 ## Checklist
 
+- [ ] `./scripts/verify.sh` (or `make verify`) passes **all four gates**: clean build with 0
+      warnings, architectural boundary/hygiene scan, headless QEMU boots on `-smp 1` and
+      `-cpu max -smp 4` (Stage A–D self-tests, 0 leaked frames, `lucyk#` prompt), and
+      `e2fsck` integrity.
 - [ ] `make clean && make` completes with **0 warnings** under `-Wall -Wextra -Werror`.
 - [ ] No BSD/POSIX identifiers leak into `src/mk/` or `src/arch/` (or `src/io/`); `src/io/`
       contains **no** `#include <bsd/...>`, and no Mach terminology was introduced.
@@ -39,6 +45,10 @@ $ make run-smp4
       `docs/BSD_SYSCALLS.md` for BSD syscalls/ioctls/errno, `docs/BSD_PERSONALITY.md` and
       `docs/ARCHITECTURE.md` as applicable), along with the matching headers under
       `src/include/`.
+- [ ] AI assistance (if used) is disclosed in the description (agent/model and what it
+      produced), and every AI-generated line was manually reviewed — especially
+      `copy_from_user`/`copy_to_user` bounds, spinlocks and lock ordering, and `W^X`
+      memory permissions. No unreviewed AI dumps.
 - [ ] I have read and agree to the
       [Code of Conduct](https://github.com/wylayss/lucyk/blob/main/CODE_OF_CONDUCT.md).
 

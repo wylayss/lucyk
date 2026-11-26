@@ -1,0 +1,37 @@
+---
+description: LucyK kernel architectural invariants and mandatory verification gate
+alwaysApply: true
+---
+
+# LucyK — Cursor Agent Rules
+
+`AGENT.md` is the single source of truth for this repository. Read it in full, then read
+`docs/ARCHITECTURE.md`, `docs/SYSCALL_ABI.md`, `docs/BSD_PERSONALITY.md`,
+`docs/BSD_SYSCALLS.md`, and `CONTRIBUTING.md` before editing code under `src/` or `user/`.
+
+## Non-negotiable rules
+
+- Freestanding C11 only: `-std=c11 -ffreestanding -nostdlib -nostdinc -Wall -Wextra -Werror`
+  plus `-mcmodel=kernel -mno-red-zone -mno-mmx -mno-sse -mno-sse2 -mno-80387`. Zero
+  warnings; no libc.
+- Zero POSIX/BSD identifiers in `src/mk/` or `src/arch/` — no `pid_t`, `fork`, `execve`,
+  `vnode`, `inode`, `errno`, `bsd_*`, `BSD_*`, `sigaction`, `mprotect`, `pgid`.
+- Zero `#include <bsd/...>` in `src/io/` (it is below `src/bsd/`).
+- Zero Mach terminology — no `mach_*`, `kern_return_t`, `vm_map`, `pmap`, `task_self`,
+  `bootstrap_port`.
+- Zero stubs/TODOs — no `TODO`, `FIXME`, `HACK`, `XXX`, empty bodies, or fake returns.
+- Strict `W^X`; route user memory through `copy_from_user`/`copy_to_user`; honor the lock
+  hierarchy and `tlb_shootdown_mask()`.
+
+## Before completing any task
+
+Run the full gate and do not finish until it passes:
+
+```bash
+./scripts/verify.sh      # or: make verify
+```
+
+It covers: clean build (0 warnings), architectural boundary/hygiene scan, headless QEMU
+boots on `-smp 1` and `-cpu max -smp 4` (Stage A–D self-tests, 0 leaked frames, `lucyk#`
+prompt), and `e2fsck` filesystem integrity. Update the relevant `docs/` file whenever an
+ABI or syscall changes.
