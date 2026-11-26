@@ -60,6 +60,16 @@ void vfs_init(void)
     }
 }
 
+sys_status_t vfs_mount_introspection(void)
+{
+    sys_status_t status = vfs_mount("/proc", procfs_root());
+
+    if (status != SYS_OK) {
+        return status;
+    }
+    return vfs_mount("/sys", sysfs_root());
+}
+
 sys_status_t vfs_set_root(vnode_t *root)
 {
     if (root == NULL || root->type != VNODE_DIR) {

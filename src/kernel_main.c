@@ -1,6 +1,7 @@
 #include <bsd/bsd.h>
 #include <cap.h>
 #include <cpu.h>
+#include <display.h>
 #include <elf.h>
 #include <gdt.h>
 #include <idt.h>
@@ -60,6 +61,13 @@ volatile struct limine_rsdp_request rsdp_request = {
 __attribute__((used, section(".limine_requests")))
 static volatile struct limine_module_request module_request = {
     .id = LIMINE_MODULE_REQUEST,
+    .revision = 0,
+    .response = NULL,
+};
+
+__attribute__((used, section(".limine_requests")))
+static volatile struct limine_framebuffer_request framebuffer_request = {
+    .id = LIMINE_FRAMEBUFFER_REQUEST,
     .revision = 0,
     .response = NULL,
 };
@@ -2420,6 +2428,647 @@ static void self_test_virtio_blk(void)
          (uint64_t)irq_events, blk_capacity_sectors());
 }
 
+/* ------------------------------------------------------------------------- */
+/* Stage E: FPU/SSE context, QoS scheduling, capability handoff              */
+/* ------------------------------------------------------------------------- */
+
+/* IEEE-754 binary64 bit pattern of an integer below 2^53, computed with
+ * integer arithmetic so the -mno-sse kernel can predict SSE results. */
+static uint64_t f64_bits_of(uint64_t value)
+{
+    if (value == 0) {
+        return 0;
+    }
+
+    uint32_t exponent = 63U - (uint32_t)__builtin_clzll(value);
+    uint64_t mantissa = (value << (52U - exponent)) & ((1ULL << 52) - 1ULL);
+
+    return ((uint64_t)(1023U + exponent) << 52) | mantissa;
+}
+
+static void sse_image_fill(uint64_t image[32], uint64_t base)
+{
+    for (uint64_t lane = 0; lane < 32; lane++) {
+        image[lane] = f64_bits_of(base + lane);
+    }
+}
+
+static bool sse_image_matches(const uint64_t image[32], uint64_t base)
+{
+    for (uint64_t lane = 0; lane < 32; lane++) {
+        if (image[lane] != f64_bits_of(base + lane)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Runs `iterations` rounds of packed double additions over all sixteen XMM
+ * registers. image holds 32 doubles (bit patterns, 16-byte aligned) that are
+ * loaded into XMM0-XMM15 first and stored back at the end; every round adds
+ * 1.0 to every lane. The whole computation lives in one asm block, so the C
+ * code around it (built with -mno-sse) never touches the registers: any value
+ * other than start + iterations is corruption by a context switch. */
+static void sse_lane_stress(uint64_t image[32], uint64_t iterations)
+{
+    static const uint64_t one_pd[2] __attribute__((aligned(16))) = {
+        0x3FF0000000000000ULL, 0x3FF0000000000000ULL
+    };
+
+    if (iterations == 0) {
+        return;
+    }
+
+    __asm__ volatile(
+        "movapd 0(%[img]), %%xmm0\n\t"
+        "movapd 16(%[img]), %%xmm1\n\t"
+        "movapd 32(%[img]), %%xmm2\n\t"
+        "movapd 48(%[img]), %%xmm3\n\t"
+        "movapd 64(%[img]), %%xmm4\n\t"
+        "movapd 80(%[img]), %%xmm5\n\t"
+        "movapd 96(%[img]), %%xmm6\n\t"
+        "movapd 112(%[img]), %%xmm7\n\t"
+        "movapd 128(%[img]), %%xmm8\n\t"
+        "movapd 144(%[img]), %%xmm9\n\t"
+        "movapd 160(%[img]), %%xmm10\n\t"
+        "movapd 176(%[img]), %%xmm11\n\t"
+        "movapd 192(%[img]), %%xmm12\n\t"
+        "movapd 208(%[img]), %%xmm13\n\t"
+        "movapd 224(%[img]), %%xmm14\n\t"
+        "movapd 240(%[img]), %%xmm15\n\t"
+        "1:\n\t"
+        "addpd (%[one]), %%xmm0\n\t"
+        "addpd (%[one]), %%xmm1\n\t"
+        "addpd (%[one]), %%xmm2\n\t"
+        "addpd (%[one]), %%xmm3\n\t"
+        "addpd (%[one]), %%xmm4\n\t"
+        "addpd (%[one]), %%xmm5\n\t"
+        "addpd (%[one]), %%xmm6\n\t"
+        "addpd (%[one]), %%xmm7\n\t"
+        "addpd (%[one]), %%xmm8\n\t"
+        "addpd (%[one]), %%xmm9\n\t"
+        "addpd (%[one]), %%xmm10\n\t"
+        "addpd (%[one]), %%xmm11\n\t"
+        "addpd (%[one]), %%xmm12\n\t"
+        "addpd (%[one]), %%xmm13\n\t"
+        "addpd (%[one]), %%xmm14\n\t"
+        "addpd (%[one]), %%xmm15\n\t"
+        "decq %[n]\n\t"
+        "jnz 1b\n\t"
+        "movapd %%xmm0, 0(%[img])\n\t"
+        "movapd %%xmm1, 16(%[img])\n\t"
+        "movapd %%xmm2, 32(%[img])\n\t"
+        "movapd %%xmm3, 48(%[img])\n\t"
+        "movapd %%xmm4, 64(%[img])\n\t"
+        "movapd %%xmm5, 80(%[img])\n\t"
+        "movapd %%xmm6, 96(%[img])\n\t"
+        "movapd %%xmm7, 112(%[img])\n\t"
+        "movapd %%xmm8, 128(%[img])\n\t"
+        "movapd %%xmm9, 144(%[img])\n\t"
+        "movapd %%xmm10, 160(%[img])\n\t"
+        "movapd %%xmm11, 176(%[img])\n\t"
+        "movapd %%xmm12, 192(%[img])\n\t"
+        "movapd %%xmm13, 208(%[img])\n\t"
+        "movapd %%xmm14, 224(%[img])\n\t"
+        "movapd %%xmm15, 240(%[img])\n\t"
+        : [n] "+r"(iterations)
+        : [img] "r"(image), [one] "r"(one_pd)
+        : "cc", "memory");
+}
+
+
+#define FPU_WORKERS    8U
+#define FPU_ROUNDS     6U
+#define FPU_ITERATIONS 60000ULL
+
+static volatile uint32_t fpu_gate;
+static volatile uint32_t fpu_done[FPU_WORKERS];
+static volatile uint32_t fpu_failed[FPU_WORKERS];
+static volatile uint32_t fpu_cpu_mask;
+
+static void fpu_worker_entry(void *arg)
+{
+    uint32_t slot = (uint32_t)(uintptr_t)arg;
+    uint64_t image[32] __attribute__((aligned(16)));
+
+    while (__atomic_load_n(&fpu_gate, __ATOMIC_ACQUIRE) == 0) {
+        thread_yield();
+    }
+
+    /* Distinct per-worker bases keep every lane of every worker unique, so a
+     * register image leaking between threads cannot go unnoticed. */
+    uint64_t base = 1000000ULL * (uint64_t)(slot + 1U);
+
+    for (uint32_t round = 0; round < FPU_ROUNDS; round++) {
+        sse_image_fill(image, base);
+        sse_lane_stress(image, FPU_ITERATIONS);
+        base += FPU_ITERATIONS;
+
+        if (!sse_image_matches(image, base)) {
+            __atomic_store_n(&fpu_failed[slot], round + 1U, __ATOMIC_RELEASE);
+        }
+
+        __atomic_fetch_or(&fpu_cpu_mask, 1U << this_cpu_index(),
+                          __ATOMIC_ACQ_REL);
+        thread_yield();
+    }
+
+    __atomic_store_n(&fpu_done[slot], 1U, __ATOMIC_RELEASE);
+    thread_exit();
+}
+
+static void run_fpu_smp_test(void)
+{
+    task_t *tasks[FPU_WORKERS / 2U];
+    uint64_t reaped_base = sched_reaped_count();
+    size_t frames_before = pmm_free_frame_count();
+
+    fpu_gate = 0;
+    fpu_cpu_mask = 0;
+
+    for (uint32_t t = 0; t < FPU_WORKERS / 2U; t++) {
+        tasks[t] = task_create();
+        if (tasks[t] == NULL) {
+            kpanic("fpu stress: task_create failed");
+        }
+        task_set_affinity(tasks[t], TASK_AFFINITY_ANY);
+    }
+
+    for (uint32_t w = 0; w < FPU_WORKERS; w++) {
+        fpu_done[w] = 0;
+        fpu_failed[w] = 0;
+
+        thread_t *thread = thread_create(tasks[w / 2U], fpu_worker_entry,
+                                         (void *)(uintptr_t)w);
+        if (thread == NULL) {
+            kpanic("fpu stress: thread_create failed");
+        }
+        if (((uintptr_t)thread->fxsave_area & 15U) != 0) {
+            kpanic("fpu stress: FXSAVE area %p misaligned", thread->fxsave_area);
+        }
+    }
+
+    /* This thread keeps its own XMM image live across the whole test, so the
+     * creator's state is checked too. */
+    uint64_t own[32] __attribute__((aligned(16)));
+    sse_image_fill(own, 77000000ULL);
+
+    __atomic_store_n(&fpu_gate, 1U, __ATOMIC_RELEASE);
+
+    uint64_t deadline = sched_tick_count() + 20000;
+    for (;;) {
+        uint32_t finished = 0;
+
+        for (uint32_t w = 0; w < FPU_WORKERS; w++) {
+            finished += __atomic_load_n(&fpu_done[w], __ATOMIC_ACQUIRE);
+        }
+        if (finished == FPU_WORKERS) {
+            break;
+        }
+        if (sched_tick_count() > deadline) {
+            kpanic("fpu stress: workers timed out (%lu/%lu)",
+                   (uint64_t)finished, (uint64_t)FPU_WORKERS);
+        }
+        sse_lane_stress(own, 1000);
+        thread_sleep_ms(1);
+    }
+
+    wait_for_reaped(reaped_base + FPU_WORKERS);
+
+    for (uint32_t w = 0; w < FPU_WORKERS; w++) {
+        if (fpu_failed[w] != 0) {
+            kpanic("fpu stress: worker %lu XMM corruption in round %lu",
+                   (uint64_t)w, (uint64_t)fpu_failed[w]);
+        }
+    }
+
+    for (uint32_t t = 0; t < FPU_WORKERS / 2U; t++) {
+        task_destroy(tasks[t]);
+    }
+
+    uint32_t online = smp_online_count();
+    uint32_t mask = __atomic_load_n(&fpu_cpu_mask, __ATOMIC_ACQUIRE);
+    uint32_t distinct = (uint32_t)__builtin_popcount(mask);
+
+    if (online >= FPU_WORKERS / 2U && distinct < FPU_WORKERS / 2U) {
+        kpanic("fpu stress: workers reached only %lu CPU(s) (mask 0x%lx)",
+               (uint64_t)distinct, (uint64_t)mask);
+    }
+    if (pmm_free_frame_count() != frames_before) {
+        kpanic("fpu stress: leaked frames (%lu -> %lu)", frames_before,
+               pmm_free_frame_count());
+    }
+
+    klog(KLOG_INFO,
+         "fpu stress: %lu workers x %lu rounds of 16-XMM addpd on %lu/%lu CPUs "
+         "(mask 0x%lx), 0 register corruptions, 0 leaked frames",
+         (uint64_t)FPU_WORKERS, (uint64_t)FPU_ROUNDS, (uint64_t)distinct,
+         (uint64_t)online, (uint64_t)mask);
+}
+
+#define QOS_TEST_MS 200U
+
+static volatile uint32_t qos_stop;
+static volatile uint64_t qos_counter[3];
+static volatile uint32_t qos_exited;
+
+static void qos_spin_entry(void *arg)
+{
+    uint32_t slot = (uint32_t)(uintptr_t)arg;
+
+    while (__atomic_load_n(&qos_stop, __ATOMIC_ACQUIRE) == 0) {
+        __atomic_fetch_add(&qos_counter[slot], 1ULL, __ATOMIC_RELAXED);
+        __asm__ volatile("pause");
+    }
+
+    __atomic_fetch_add(&qos_exited, 1U, __ATOMIC_ACQ_REL);
+    thread_exit();
+}
+
+/* Two never-blocking INTERACTIVE spinners share one CPU with a BACKGROUND
+ * spinner and with this DEFAULT thread. Strict priority alone would starve
+ * both lower classes; aging must keep them moving while the interactive class
+ * still receives the bulk of the CPU. */
+static void run_qos_aging_test(void)
+{
+    task_t *task = task_create();
+    if (task == NULL) {
+        kpanic("qos: task_create failed");
+    }
+
+    uint64_t reaped_base = sched_reaped_count();
+
+    qos_stop = 0;
+    qos_exited = 0;
+    for (uint32_t i = 0; i < 3; i++) {
+        qos_counter[i] = 0;
+    }
+
+    thread_t *spinners[3];
+
+    for (uint32_t i = 0; i < 3; i++) {
+        spinners[i] = thread_create(task, qos_spin_entry, (void *)(uintptr_t)i);
+        if (spinners[i] == NULL) {
+            kpanic("qos: thread_create failed");
+        }
+    }
+    if (thread_set_qos(spinners[0], THREAD_QOS_INTERACTIVE) != SYS_OK ||
+        thread_set_qos(spinners[1], THREAD_QOS_INTERACTIVE) != SYS_OK ||
+        thread_set_qos(spinners[2], THREAD_QOS_BACKGROUND) != SYS_OK ||
+        thread_set_qos(spinners[2], THREAD_QOS_COUNT) != SYS_ERR_INVAL) {
+        kpanic("qos: thread_set_qos rejected a valid class or accepted 3");
+    }
+    if (spinners[0]->effective_qos != THREAD_QOS_INTERACTIVE ||
+        spinners[2]->effective_qos != THREAD_QOS_BACKGROUND) {
+        kpanic("qos: effective class not updated");
+    }
+
+    uint64_t start = sched_tick_count();
+    thread_sleep_ms(QOS_TEST_MS);
+    uint64_t slept = sched_tick_count() - start;
+
+    __atomic_store_n(&qos_stop, 1U, __ATOMIC_RELEASE);
+
+    uint64_t deadline = sched_tick_count() + 5000;
+    while (__atomic_load_n(&qos_exited, __ATOMIC_ACQUIRE) != 3) {
+        if (sched_tick_count() > deadline) {
+            kpanic("qos: spinners did not stop");
+        }
+        thread_sleep_ms(1);
+    }
+    wait_for_reaped(reaped_base + 3);
+    task_destroy(task);
+
+    uint64_t interactive = qos_counter[0] + qos_counter[1];
+    uint64_t background = qos_counter[2];
+
+    if (background == 0) {
+        kpanic("qos: BACKGROUND thread starved under interactive load");
+    }
+    if (interactive < background * 4ULL) {
+        kpanic("qos: INTERACTIVE share too small (%lu vs background %lu)",
+               interactive, background);
+    }
+    if (slept > (uint64_t)QOS_TEST_MS + 100ULL) {
+        kpanic("qos: DEFAULT sleeper woke %lu ms late", slept - QOS_TEST_MS);
+    }
+
+    klog(KLOG_INFO,
+         "qos: interactive %lu vs background %lu spins (background aged, "
+         "not starved); default sleeper woke after %lu ms",
+         interactive, background, slept);
+}
+
+/* Device and shared CAP_OBJ_FRAME semantics: device frames never touch the
+ * PMM, are shared (not copied) by vspace_clone() and refuse EXEC; shared
+ * frames survive until the last mapping and the capability are gone. */
+static void run_frame_cap_test(paddr_t device_phys)
+{
+    const vaddr_t va = 0x0000003000000000ULL;
+    size_t frames_before = pmm_free_frame_count();
+
+    mk_object_t *device = cap_device_frame_object_create(device_phys, 2, true);
+    if (device == NULL) {
+        kpanic("frame caps: device frame creation failed");
+    }
+    cap_frame_object_t *dev = (cap_frame_object_t *)device;
+
+    vspace_t *a = vspace_create();
+    if (a == NULL) {
+        kpanic("frame caps: vspace_create failed");
+    }
+    if (cap_frame_map(dev, a, va, VSPACE_PROT_EXEC) != SYS_ERR_INVAL) {
+        kpanic("frame caps: executable device mapping accepted");
+    }
+    if (cap_frame_map(dev, a, va, VSPACE_PROT_WRITE) != SYS_OK ||
+        cap_frame_map(dev, a, va + 0x10000, 0) != SYS_OK) {
+        kpanic("frame caps: device frame map failed");
+    }
+
+    vspace_t *b = vspace_clone(a);
+    if (b == NULL) {
+        kpanic("frame caps: vspace_clone failed");
+    }
+
+    paddr_t pa = 0;
+    paddr_t pb = 0;
+    if (!vspace_translate(a, va + PAGE_SIZE, &pa) ||
+        !vspace_translate(b, va + PAGE_SIZE, &pb) ||
+        pa != device_phys + PAGE_SIZE || pb != pa) {
+        kpanic("frame caps: clone did not alias the device range");
+    }
+    if (vspace_unmap(a, va) != SYS_OK) {
+        kpanic("frame caps: device unmap failed");
+    }
+
+    paddr_t shared_phys = pmm_alloc_frame();
+    if (shared_phys == 0) {
+        kpanic("frame caps: frame allocation failed");
+    }
+    mk_object_t *shared = cap_shared_frame_object_create(shared_phys);
+    if (shared == NULL) {
+        kpanic("frame caps: shared frame creation failed");
+    }
+    cap_frame_object_t *sh = (cap_frame_object_t *)shared;
+
+    if (cap_frame_map(sh, a, va + 0x20000, VSPACE_PROT_WRITE) != SYS_OK ||
+        cap_frame_map(sh, b, va + 0x20000, 0) != SYS_OK ||
+        pmm_frame_refcount(shared_phys) != 3) {
+        kpanic("frame caps: shared frame mapping/refcount wrong (%lu)",
+               (uint64_t)pmm_frame_refcount(shared_phys));
+    }
+
+    *(volatile uint64_t *)pmm_phys_to_virt(shared_phys) = 0x5354414745450045ULL;
+
+    vspace_destroy(a);
+    mk_object_release(shared);
+    if (pmm_frame_refcount(shared_phys) != 1) {
+        kpanic("frame caps: shared frame lost its last mapping reference");
+    }
+    vspace_destroy(b);
+    mk_object_release(device);
+
+    if (pmm_free_frame_count() != frames_before) {
+        kpanic("frame caps: leaked or over-freed frames (%lu -> %lu)",
+               frames_before, pmm_free_frame_count());
+    }
+
+    klog(KLOG_INFO,
+         "frame caps: device frame (WC, NX, clone-shared, never PMM-freed) and "
+         "shared frame refcounts verified, 0 leaked frames");
+}
+
+#define IRQ_TEST_BIT 0x4ULL
+
+/* CAP_OBJ_IRQ over an IOAPIC GSI: binding unmasks the line, a delivery masks
+ * it and signals the notification, SYS_IRQ_ACK unmasks it, and deleting the
+ * capability masks and releases the GSI. The interrupt is injected as a
+ * self-IPI on the allocated vector, which runs the same handler an IOAPIC
+ * delivery would. */
+static void run_irq_cap_test(void)
+{
+    if (!ioapic_available()) {
+        klog(KLOG_WARN, "irq caps: no IOAPIC, test skipped");
+        return;
+    }
+
+    if (blk_present()) {
+        uint8_t blk_gsi = 0;
+        bool low = false;
+        bool level = false;
+        const pci_device_t *blk = pci_find_device(0x1AF4, 0x1001);
+
+        if (blk != NULL &&
+            ioapic_resolve_irq(blk->interrupt_line, &blk_gsi, &low, &level)) {
+            mk_object_t *clash = cap_irq_gsi_object_create(blk_gsi, low, level);
+
+            if (clash != NULL) {
+                kpanic("irq caps: GSI %lu owned by virtio-blk was granted",
+                       (uint64_t)blk_gsi);
+            }
+        }
+    }
+
+    mk_object_t *object = NULL;
+    uint8_t gsi = 0;
+
+    for (uint32_t candidate = 23; candidate >= 16; candidate--) {
+        object = cap_irq_gsi_object_create((uint8_t)candidate, true, true);
+        if (object != NULL) {
+            gsi = (uint8_t)candidate;
+            break;
+        }
+    }
+    if (object == NULL) {
+        kpanic("irq caps: no free GSI in 16..23");
+    }
+
+    cap_irq_object_t *irq = (cap_irq_object_t *)object;
+    uint8_t vector = irq->vector;
+    notification_t *notification = notification_create();
+    task_t *task = task_create();
+
+    if (notification == NULL || task == NULL) {
+        kpanic("irq caps: allocation failed");
+    }
+
+    cap_t irq_cap = CAP_NULL;
+    cap_t ntf_cap = CAP_NULL;
+    if (cap_insert(task->caps, CAP_OBJ_IRQ, object, CAP_RIGHT_ALL, 0,
+                   &irq_cap) != SYS_OK ||
+        cap_insert(task->caps, CAP_OBJ_NOTIFICATION, notification,
+                   CAP_RIGHT_ALL, 0, &ntf_cap) != SYS_OK) {
+        kpanic("irq caps: cap_insert failed");
+    }
+    mk_object_release(object);
+    mk_object_release(&notification->header);
+
+    if (!ioapic_irq_is_masked(gsi)) {
+        kpanic("irq caps: unbound GSI %lu is unmasked", (uint64_t)gsi);
+    }
+    if (irq_cap_ack(irq) != SYS_ERR_INVAL) {
+        kpanic("irq caps: ack without a binding accepted");
+    }
+    if (irq_cap_bind(irq, notification, IRQ_TEST_BIT) != SYS_OK) {
+        kpanic("irq caps: bind failed");
+    }
+    if (ioapic_irq_is_masked(gsi)) {
+        kpanic("irq caps: bound GSI %lu still masked", (uint64_t)gsi);
+    }
+
+    for (uint32_t round = 0; round < 2; round++) {
+        uint64_t before = irq->fire_count;
+
+        lapic_send_ipi(lapic_id(), irq->vector);
+
+        uint64_t deadline = sched_tick_count() + 1000;
+        while (__atomic_load_n(&irq->fire_count, __ATOMIC_ACQUIRE) == before) {
+            if (sched_tick_count() > deadline) {
+                kpanic("irq caps: vector 0x%lx never fired",
+                       (uint64_t)irq->vector);
+            }
+            thread_sleep_ms(1);
+        }
+
+        uint64_t flags = irq_save();
+        uint64_t word = notification->word;
+        notification->word = 0;
+        irq_restore(flags);
+
+        if ((word & IRQ_TEST_BIT) == 0 || !irq->awaiting_ack ||
+            !ioapic_irq_is_masked(gsi)) {
+            kpanic("irq caps: delivery did not signal+mask (word 0x%lx)", word);
+        }
+        if (irq_cap_ack(irq) != SYS_OK || irq->awaiting_ack ||
+            ioapic_irq_is_masked(gsi)) {
+            kpanic("irq caps: SYS_IRQ_ACK did not unmask GSI %lu",
+                   (uint64_t)gsi);
+        }
+    }
+
+    if (cap_delete(task->caps, irq_cap) != SYS_OK ||
+        cap_delete(task->caps, ntf_cap) != SYS_OK) {
+        kpanic("irq caps: cap_delete failed");
+    }
+    if (!ioapic_irq_is_masked(gsi)) {
+        kpanic("irq caps: released GSI %lu left unmasked", (uint64_t)gsi);
+    }
+
+    mk_object_t *again = cap_irq_gsi_object_create(gsi, true, true);
+    if (again == NULL) {
+        kpanic("irq caps: GSI %lu was not released", (uint64_t)gsi);
+    }
+    mk_object_release(again);
+    task_destroy(task);
+
+    if (mk_object_live_count() != 0) {
+        kpanic("irq caps: %lu objects leaked", mk_object_live_count());
+    }
+
+    klog(KLOG_INFO,
+         "irq caps: GSI %lu -> vector 0x%lx bound to a notification, "
+         "fire->mask->notify->SYS_IRQ_ACK->unmask x2, release masks the line",
+         (uint64_t)gsi, (uint64_t)vector);
+}
+
+/* Wraps the Limine framebuffer into a write-combining device frame and a
+ * read-only display-info frame, registered as boot capabilities 1 and 2 for
+ * PID 1. */
+static void publish_boot_display(void)
+{
+    struct limine_framebuffer_response *response = framebuffer_request.response;
+
+    if (response == NULL || response->framebuffer_count == 0 ||
+        response->framebuffers == NULL || response->framebuffers[0] == NULL) {
+        klog(KLOG_WARN, "display: bootloader reported no framebuffer");
+        return;
+    }
+
+    struct limine_framebuffer *fb = response->framebuffers[0];
+    uint64_t hhdm = hhdm_request.response->offset;
+    uint64_t virt = (uint64_t)(uintptr_t)fb->address;
+
+    if (virt < hhdm || fb->pitch == 0 || fb->height == 0) {
+        klog(KLOG_WARN, "display: framebuffer descriptor unusable");
+        return;
+    }
+
+    paddr_t phys = virt - hhdm;
+    uint64_t size = fb->pitch * fb->height;
+    paddr_t base = PAGE_ALIGN_DOWN(phys);
+    uint64_t span = PAGE_ALIGN_UP(phys + size) - base;
+    bool wc = cpu_write_combining_pat_entry() != 0;
+
+    run_frame_cap_test(base);
+
+    mk_object_t *fb_object =
+        cap_device_frame_object_create(base, (size_t)(span / PAGE_SIZE), wc);
+    paddr_t info_phys = pmm_alloc_frame();
+
+    if (fb_object == NULL || info_phys == 0) {
+        kpanic("display: cannot allocate the framebuffer capabilities");
+    }
+
+    display_info_t *info = (display_info_t *)pmm_phys_to_virt(info_phys);
+
+    memset(info, 0, sizeof(*info));
+    info->magic = DISPLAY_INFO_MAGIC;
+    info->version = DISPLAY_INFO_VERSION;
+    info->framebuffer_count = (uint32_t)response->framebuffer_count;
+    info->phys_base = phys;
+    info->size_bytes = size;
+    info->mapped_bytes = span;
+    info->width = fb->width;
+    info->height = fb->height;
+    info->pitch = fb->pitch;
+    info->bpp = fb->bpp;
+    info->memory_model = fb->memory_model;
+    info->red_mask_size = fb->red_mask_size;
+    info->red_mask_shift = fb->red_mask_shift;
+    info->green_mask_size = fb->green_mask_size;
+    info->green_mask_shift = fb->green_mask_shift;
+    info->blue_mask_size = fb->blue_mask_size;
+    info->blue_mask_shift = fb->blue_mask_shift;
+    info->write_combining = wc ? 1U : 0U;
+
+    mk_object_t *info_object = cap_shared_frame_object_create(info_phys);
+    if (info_object == NULL) {
+        kpanic("display: cannot wrap the display-info frame");
+    }
+
+    cap_t fb_handle = CAP_NULL;
+    cap_t info_handle = CAP_NULL;
+
+    if (cap_boot_register(CAP_OBJ_FRAME, fb_object,
+                          CAP_RIGHT_READ | CAP_RIGHT_WRITE | CAP_RIGHT_GRANT,
+                          &fb_handle) != SYS_OK ||
+        cap_boot_register(CAP_OBJ_FRAME, info_object,
+                          CAP_RIGHT_READ | CAP_RIGHT_GRANT,
+                          &info_handle) != SYS_OK ||
+        fb_handle != DISPLAY_BOOT_CAP_FRAMEBUFFER ||
+        info_handle != DISPLAY_BOOT_CAP_INFO) {
+        kpanic("display: boot capability registration failed");
+    }
+
+    /* The boot registry holds the references from here on. */
+    mk_object_release(fb_object);
+    mk_object_release(info_object);
+
+    klog(KLOG_INFO,
+         "display: %lux%lu %lubpp pitch %lu at 0x%lx (%lu KiB, %s) -> boot caps "
+         "%lu (framebuffer) + %lu (read-only display info) for PID 1",
+         fb->width, fb->height, (uint64_t)fb->bpp, fb->pitch, phys,
+         span / 1024ULL, wc ? "write-combining" : "uncached",
+         (uint64_t)fb_handle, (uint64_t)info_handle);
+}
+
+static void run_stage_e_tests(void)
+{
+    run_fpu_smp_test();
+    run_qos_aging_test();
+    run_irq_cap_test();
+}
+
 static void selftest_entry(void *arg)
 {
     UNUSED(arg);
@@ -2555,6 +3204,8 @@ static void selftest_entry(void *arg)
     run_smp_stress_test();
     run_cow_stress_test();
     self_test_virtio_blk();
+    run_stage_e_tests();
+    publish_boot_display();
 
     collect_bsd_boot_modules();
     bsd_init(bsd_boot_modules, bsd_boot_module_count);

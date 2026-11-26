@@ -30,6 +30,39 @@ static ioapic_unit_t ioapic_units[ACPI_MAX_IOAPICS];
 static uint32_t ioapic_total;
 static spinlock_t ioapic_lock;
 
+/* GSIs currently routed, by a kernel driver or a capability. Guarded by
+ * ioapic_lock. */
+static uint64_t ioapic_gsi_claimed[4];
+
+static bool gsi_claimed_locked(uint8_t gsi)
+{
+    return (ioapic_gsi_claimed[gsi / 64U] & (1ULL << (gsi % 64U))) != 0;
+}
+
+static void gsi_set_claimed_locked(uint8_t gsi, bool claimed)
+{
+    if (claimed) {
+        ioapic_gsi_claimed[gsi / 64U] |= 1ULL << (gsi % 64U);
+    } else {
+        ioapic_gsi_claimed[gsi / 64U] &= ~(1ULL << (gsi % 64U));
+    }
+}
+
+static uint32_t redirection_low(uint8_t vector, bool active_low,
+                                bool level_triggered)
+{
+    uint32_t low = (uint32_t)vector;
+
+    /* Fixed delivery, physical destination. */
+    if (active_low) {
+        low |= IOAPIC_REDTBL_POLARITY;
+    }
+    if (level_triggered) {
+        low |= IOAPIC_REDTBL_TRIGGER;
+    }
+    return low;
+}
+
 static uint32_t ioapic_reg_read(const ioapic_unit_t *unit, uint32_t reg)
 {
     volatile uint32_t *select =
@@ -74,6 +107,7 @@ void ioapic_init(void)
 {
     spinlock_init(&ioapic_lock);
     memset(ioapic_units, 0, sizeof(ioapic_units));
+    memset(ioapic_gsi_claimed, 0, sizeof(ioapic_gsi_claimed));
     ioapic_total = 0;
 
     outb(0x21, 0xFF);
@@ -181,24 +215,86 @@ sys_status_t ioapic_route_irq(uint8_t gsi, uint8_t vector,
     }
 
     uint32_t pin = (uint32_t)gsi - unit->gsi_base;
-    uint32_t low = (uint32_t)vector;
-
-    /* Fixed delivery, physical destination, unmasked. */
-    if (active_low) {
-        low |= IOAPIC_REDTBL_POLARITY;
-    }
-    if (level_triggered) {
-        low |= IOAPIC_REDTBL_TRIGGER;
-    }
+    uint32_t low = redirection_low(vector, active_low, level_triggered);
 
     uint32_t high = (dest_lapic_id & 0xFFU) << 24;
 
-    /* The high word must be stable before the low word commits the entry. */
+    /* The high word must be stable before the low word commits the entry,
+     * which is written unmasked. */
     ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U) + 1U, high);
     ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U), low);
+    gsi_set_claimed_locked(gsi, true);
 
     spin_unlock_irqrestore(&ioapic_lock, flags);
     return SYS_OK;
+}
+
+sys_status_t ioapic_bind_cap_irq(uint8_t gsi, uint8_t vector,
+                                 uint32_t dest_lapic_id, bool active_low,
+                                 bool level_triggered)
+{
+    if (vector < IOAPIC_VECTOR_MIN || vector > IOAPIC_VECTOR_MAX ||
+        dest_lapic_id > 0xFFU) {
+        return SYS_ERR_INVAL;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&ioapic_lock);
+    ioapic_unit_t *unit = ioapic_for_gsi(gsi);
+
+    if (unit == NULL) {
+        spin_unlock_irqrestore(&ioapic_lock, flags);
+        return SYS_ERR_INVAL;
+    }
+    if (gsi_claimed_locked(gsi)) {
+        spin_unlock_irqrestore(&ioapic_lock, flags);
+        return SYS_ERR_BUSY;
+    }
+
+    uint32_t pin = (uint32_t)gsi - unit->gsi_base;
+    uint32_t low = redirection_low(vector, active_low, level_triggered) |
+                   IOAPIC_REDTBL_MASK;
+    uint32_t high = (dest_lapic_id & 0xFFU) << 24;
+
+    ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U) + 1U, high);
+    ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U), low);
+    gsi_set_claimed_locked(gsi, true);
+
+    spin_unlock_irqrestore(&ioapic_lock, flags);
+    return SYS_OK;
+}
+
+void ioapic_unbind_cap_irq(uint8_t gsi)
+{
+    uint64_t flags = spin_lock_irqsave(&ioapic_lock);
+    ioapic_unit_t *unit = ioapic_for_gsi(gsi);
+
+    if (unit != NULL) {
+        uint32_t pin = (uint32_t)gsi - unit->gsi_base;
+
+        ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U),
+                         IOAPIC_REDTBL_MASK);
+        ioapic_reg_write(unit, IOAPIC_REG_REDTBL + (pin * 2U) + 1U, 0);
+    }
+    gsi_set_claimed_locked(gsi, false);
+
+    spin_unlock_irqrestore(&ioapic_lock, flags);
+}
+
+bool ioapic_irq_is_masked(uint8_t gsi)
+{
+    uint64_t flags = spin_lock_irqsave(&ioapic_lock);
+    ioapic_unit_t *unit = ioapic_for_gsi(gsi);
+    bool masked = true;
+
+    if (unit != NULL) {
+        uint32_t pin = (uint32_t)gsi - unit->gsi_base;
+
+        masked = (ioapic_reg_read(unit, IOAPIC_REG_REDTBL + (pin * 2U)) &
+                  IOAPIC_REDTBL_MASK) != 0;
+    }
+
+    spin_unlock_irqrestore(&ioapic_lock, flags);
+    return masked;
 }
 
 void ioapic_unmask_irq(uint8_t gsi)

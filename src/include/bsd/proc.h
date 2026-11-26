@@ -195,6 +195,40 @@ bool bsd_proc_has_pending(bsd_proc_t *proc);
  * the handler. Fatal default signals terminate the calling task. */
 void bsd_proc_deliver_signals(bsd_proc_t *proc, syscall_frame_t *frame);
 
+/* Introspection snapshot used by /proc. Every field is copied under the
+ * process-table lock; vspace (when requested) carries one reference that the
+ * caller drops with vspace_destroy(). */
+typedef struct bsd_proc_info {
+    int32_t           pid;
+    int32_t           ppid;
+    int32_t           pgid;
+    uint32_t          uid;
+    uint32_t          gid;
+    bsd_proc_state_t  state;
+    uint32_t          threads;
+    uint64_t          task_id;
+    uint8_t           base_qos;      /* Of the task's first thread */
+    uint8_t           effective_qos;
+    uint64_t          pending_signals;
+    uint64_t          signal_mask;
+    vaddr_t           brk_base;
+    vaddr_t           brk_current;
+    bsd_mmap_region_t mmap_regions[BSD_MAX_MMAPS];
+    char              comm[BSD_COMM_LEN];
+    vspace_t         *vspace;
+} bsd_proc_info_t;
+
+/* Fills *out for a live (running or zombie) pid. want_vspace retains the
+ * address space of a running process. */
+bool bsd_proc_snapshot(int32_t pid, bool want_vspace, bsd_proc_info_t *out);
+
+/* Smallest live pid greater than `after`, or 0 when there is none. */
+int32_t bsd_proc_next_pid(int32_t after);
+
+/* Installs the kernel's boot capabilities (framebuffer and display-info
+ * frames) into a freshly created PID 1, before its first thread runs. */
+sys_status_t bsd_proc_install_boot_caps(bsd_proc_t *proc);
+
 /* mk_hooks_t callbacks for mk_register_hooks(). */
 const mk_hooks_t *bsd_proc_get_hooks(void);
 

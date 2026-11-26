@@ -335,3 +335,12 @@ const pci_device_t *pci_device_at(size_t index)
 
     return &pci_devices[index];
 }
+bool pci_device_snapshot(size_t index, pci_device_t *out)
+{
+    if (out == NULL || index >= pci_count) {
+        return false;
+    }
+
+    memcpy(out, &pci_devices[index], sizeof(*out));
+    return true;
+}

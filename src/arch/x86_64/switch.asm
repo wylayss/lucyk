@@ -9,13 +9,23 @@ global boot_stack_enter
 extern thread_entry_c
 
 ; void switch_context(cpu_context_t **old_ctx, cpu_context_t *new_ctx,
-;                     uint64_t new_rsp0, uint64_t new_cr3)
+;                     uint64_t new_rsp0, uint64_t new_cr3,
+;                     uint8_t *old_fx, const uint8_t *new_fx)
 ;
-; Saves callee-saved registers and the resume RIP, installs the new stack,
-; updates this CPU's TSS.rsp0 and GS-resident kernel_rsp, and reloads CR3 when
-; new_cr3 is non-zero. IA32_FS_BASE save/restore is handled by the caller
-; (sched.c switch_to) via RDMSR/WRMSR around this call.
+; Saves the outgoing FPU/SSE image (FXSAVE64 into old_fx, r8), the
+; callee-saved registers and the resume RIP, installs the new stack, updates
+; this CPU's TSS.rsp0 and GS-resident kernel_rsp, reloads CR3 when new_cr3 is
+; non-zero, and restores the incoming FPU/SSE image (FXRSTOR64 from new_fx,
+; r9). Both images are 16-byte aligned 512-byte areas; NULL skips the step.
+; The kernel is compiled without x87/SSE code generation, so the registers
+; saved here always hold the outgoing thread's own (user) state.
+; IA32_FS_BASE save/restore is handled by the caller (sched.c switch_to) via
+; RDMSR/WRMSR around this call.
 switch_context:
+    test r8, r8
+    jz .no_fx_save
+    fxsave64 [r8]
+.no_fx_save:
     push rbp
     push rbx
     push r12
@@ -28,10 +38,10 @@ switch_context:
 
     ; TSS.rsp0 = new_rsp0 for the calling CPU, selected by cpu_index.
     mov rax, [gs:48]          ; cpu_local_t *self
-    mov r8d, [rax + 16]       ; cpu_index
-    lea r9, [rel gdt_tss_bases]
-    mov r10, [r9 + r8 * 8]    ; tss64_t * for this CPU
-    mov [r10 + 4], rdx        ; tss->rsp0
+    mov r10d, [rax + 16]      ; cpu_index
+    lea r11, [rel gdt_tss_bases]
+    mov r11, [r11 + r10 * 8]  ; tss64_t * for this CPU
+    mov [r11 + 4], rdx        ; tss->rsp0
 
     ; Keep the SYSCALL kernel stack pointer in lockstep with TSS.rsp0.
     mov [rax + 0], rdx
@@ -40,6 +50,11 @@ switch_context:
     jz .no_cr3
     mov cr3, rcx
 .no_cr3:
+
+    test r9, r9
+    jz .no_fx_restore
+    fxrstor64 [r9]
+.no_fx_restore:
 
     pop r15
     pop r14

@@ -1,5 +1,15 @@
 #include "bsd_user.h"
 
+#include <display.h>
+#include <syscall_numbers.h>
+
+/* Native ABI values used by the Stage E tests (docs/SYSCALL_ABI.md). */
+#define SYS_ERR_INVAL_USER      (-1)
+#define SYS_ERR_CAP_RIGHTS_USER (-4)
+#define SYS_CAP_RIGHT_READ      0x1ULL
+#define SYS_CAP_RIGHT_ALL       0xFULL
+#define PAGE_BYTES              4096ULL
+
 #define PIPE_TEST_CHUNK   256
 #define PIPE_TEST_CHUNKS  3
 #define PIPE_TEST_TOTAL   (PIPE_TEST_CHUNK * PIPE_TEST_CHUNKS)
@@ -1341,6 +1351,828 @@ static void test_ext2_concurrent(void)
                "init: ext2 4-process concurrent create/write/read/unlink passed\n");
 }
 
+
+/* ------------------------------------------------------------------------- */
+/* Kernel Stage E: FPU/SSE, QoS + priority inheritance, capability handoff,   */
+/* /proc and /sys, execve envp                                                */
+/* ------------------------------------------------------------------------- */
+
+#define SSE_ITERATIONS 250000ULL
+#define SSE_ROUNDS     4U
+#define SSE_CHILDREN   3
+
+#define STAGE_E_INFO_VA 0x0000007300000000ULL
+#define STAGE_E_FB_VA   0x0000007400000000ULL
+#define STAGE_E_PROT_WRITE 1ULL
+
+typedef struct native_result {
+    int64_t  status;
+    uint64_t rdx;
+    uint64_t rsi;
+    uint64_t r8;
+    uint64_t r9;
+    uint64_t r10;
+} native_result_t;
+
+/* Native microkernel syscall (bit 63 set) returning every result register. */
+static native_result_t native_call(uint64_t number, uint64_t a1, uint64_t a2,
+                                   uint64_t a3, uint64_t a4, uint64_t a5)
+{
+    register uint64_t rdi __asm__("rdi") = a1;
+    register uint64_t rsi __asm__("rsi") = a2;
+    register uint64_t rdx __asm__("rdx") = a3;
+    register uint64_t r10 __asm__("r10") = a4;
+    register uint64_t r8 __asm__("r8") = a5;
+    register uint64_t r9 __asm__("r9") = 0;
+    uint64_t rax = number;
+
+    __asm__ volatile("syscall"
+                     : "+a"(rax), "+r"(rdi), "+r"(rsi), "+r"(rdx), "+r"(r10),
+                       "+r"(r8), "+r"(r9)
+                     :
+                     : "rcx", "r11", "cc", "memory");
+
+    native_result_t result = { (int64_t)rax, rdx, rsi, r8, r9, r10 };
+    return result;
+}
+
+/* binary64 bit pattern of an integer below 2^53 (integer arithmetic only:
+ * this program is compiled with -mno-sse and never lets the compiler touch
+ * the XMM registers, so all SSE work below lives in asm blocks). */
+static uint64_t f64_bits_of(uint64_t value)
+{
+    if (value == 0) {
+        return 0;
+    }
+
+    uint32_t exponent = 63U - (uint32_t)__builtin_clzll(value);
+    uint64_t mantissa = (value << (52U - exponent)) & ((1ULL << 52) - 1ULL);
+
+    return ((uint64_t)(1023U + exponent) << 52) | mantissa;
+}
+
+static void sse_image_fill(uint64_t image[32], uint64_t base)
+{
+    for (uint64_t lane = 0; lane < 32; lane++) {
+        image[lane] = f64_bits_of(base + lane);
+    }
+}
+
+static bool sse_image_matches(const uint64_t image[32], uint64_t base)
+{
+    for (uint64_t lane = 0; lane < 32; lane++) {
+        if (image[lane] != f64_bits_of(base + lane)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const uint64_t sse_one_pd[2] __attribute__((aligned(16))) = {
+    0x3FF0000000000000ULL, 0x3FF0000000000000ULL
+};
+
+/* XMM0-15 <- image; `iterations` rounds of addpd 1.0 on every lane; image <-
+ * XMM0-15. Long enough to be preempted many times on a 1 kHz timer. */
+static void sse_lane_stress(uint64_t image[32], uint64_t iterations)
+{
+    __asm__ volatile(
+        "movapd 0(%[img]), %%xmm0\n\t"
+        "movapd 16(%[img]), %%xmm1\n\t"
+        "movapd 32(%[img]), %%xmm2\n\t"
+        "movapd 48(%[img]), %%xmm3\n\t"
+        "movapd 64(%[img]), %%xmm4\n\t"
+        "movapd 80(%[img]), %%xmm5\n\t"
+        "movapd 96(%[img]), %%xmm6\n\t"
+        "movapd 112(%[img]), %%xmm7\n\t"
+        "movapd 128(%[img]), %%xmm8\n\t"
+        "movapd 144(%[img]), %%xmm9\n\t"
+        "movapd 160(%[img]), %%xmm10\n\t"
+        "movapd 176(%[img]), %%xmm11\n\t"
+        "movapd 192(%[img]), %%xmm12\n\t"
+        "movapd 208(%[img]), %%xmm13\n\t"
+        "movapd 224(%[img]), %%xmm14\n\t"
+        "movapd 240(%[img]), %%xmm15\n\t"
+        "1:\n\t"
+        "addpd (%[one]), %%xmm0\n\t"
+        "addpd (%[one]), %%xmm1\n\t"
+        "addpd (%[one]), %%xmm2\n\t"
+        "addpd (%[one]), %%xmm3\n\t"
+        "addpd (%[one]), %%xmm4\n\t"
+        "addpd (%[one]), %%xmm5\n\t"
+        "addpd (%[one]), %%xmm6\n\t"
+        "addpd (%[one]), %%xmm7\n\t"
+        "addpd (%[one]), %%xmm8\n\t"
+        "addpd (%[one]), %%xmm9\n\t"
+        "addpd (%[one]), %%xmm10\n\t"
+        "addpd (%[one]), %%xmm11\n\t"
+        "addpd (%[one]), %%xmm12\n\t"
+        "addpd (%[one]), %%xmm13\n\t"
+        "addpd (%[one]), %%xmm14\n\t"
+        "addpd (%[one]), %%xmm15\n\t"
+        "decq %[n]\n\t"
+        "jnz 1b\n\t"
+        "movapd %%xmm0, 0(%[img])\n\t"
+        "movapd %%xmm1, 16(%[img])\n\t"
+        "movapd %%xmm2, 32(%[img])\n\t"
+        "movapd %%xmm3, 48(%[img])\n\t"
+        "movapd %%xmm4, 64(%[img])\n\t"
+        "movapd %%xmm5, 80(%[img])\n\t"
+        "movapd %%xmm6, 96(%[img])\n\t"
+        "movapd %%xmm7, 112(%[img])\n\t"
+        "movapd %%xmm8, 128(%[img])\n\t"
+        "movapd %%xmm9, 144(%[img])\n\t"
+        "movapd %%xmm10, 160(%[img])\n\t"
+        "movapd %%xmm11, 176(%[img])\n\t"
+        "movapd %%xmm12, 192(%[img])\n\t"
+        "movapd %%xmm13, 208(%[img])\n\t"
+        "movapd %%xmm14, 224(%[img])\n\t"
+        "movapd %%xmm15, 240(%[img])\n\t"
+        : [n] "+r"(iterations)
+        : [img] "r"(image), [one] "r"(sse_one_pd)
+        : "cc", "memory");
+}
+
+/* XMM0-15 <- image, then fork() with the registers live, then out <- XMM0-15
+ * in both the parent and the child. Returns fork()'s rax. */
+static int64_t sse_fork_with_live_xmm(const uint64_t image[32],
+                                      uint64_t out[32])
+{
+    uint64_t rax = BSD_SYS_FORK;
+
+    __asm__ volatile(
+        "movapd 0(%[img]), %%xmm0\n\t"
+        "movapd 16(%[img]), %%xmm1\n\t"
+        "movapd 32(%[img]), %%xmm2\n\t"
+        "movapd 48(%[img]), %%xmm3\n\t"
+        "movapd 64(%[img]), %%xmm4\n\t"
+        "movapd 80(%[img]), %%xmm5\n\t"
+        "movapd 96(%[img]), %%xmm6\n\t"
+        "movapd 112(%[img]), %%xmm7\n\t"
+        "movapd 128(%[img]), %%xmm8\n\t"
+        "movapd 144(%[img]), %%xmm9\n\t"
+        "movapd 160(%[img]), %%xmm10\n\t"
+        "movapd 176(%[img]), %%xmm11\n\t"
+        "movapd 192(%[img]), %%xmm12\n\t"
+        "movapd 208(%[img]), %%xmm13\n\t"
+        "movapd 224(%[img]), %%xmm14\n\t"
+        "movapd 240(%[img]), %%xmm15\n\t"
+        "syscall\n\t"
+        "movapd %%xmm0, 0(%[out])\n\t"
+        "movapd %%xmm1, 16(%[out])\n\t"
+        "movapd %%xmm2, 32(%[out])\n\t"
+        "movapd %%xmm3, 48(%[out])\n\t"
+        "movapd %%xmm4, 64(%[out])\n\t"
+        "movapd %%xmm5, 80(%[out])\n\t"
+        "movapd %%xmm6, 96(%[out])\n\t"
+        "movapd %%xmm7, 112(%[out])\n\t"
+        "movapd %%xmm8, 128(%[out])\n\t"
+        "movapd %%xmm9, 144(%[out])\n\t"
+        "movapd %%xmm10, 160(%[out])\n\t"
+        "movapd %%xmm11, 176(%[out])\n\t"
+        "movapd %%xmm12, 192(%[out])\n\t"
+        "movapd %%xmm13, 208(%[out])\n\t"
+        "movapd %%xmm14, 224(%[out])\n\t"
+        "movapd %%xmm15, 240(%[out])\n\t"
+        : "+a"(rax)
+        : [img] "r"(image), [out] "r"(out)
+        : "rcx", "r11", "rdi", "rsi", "rdx", "r8", "r9", "r10", "cc",
+          "memory");
+    return (int64_t)rax;
+}
+
+static void sse_store_all(uint64_t out[32], uint32_t *mxcsr)
+{
+    __asm__ volatile(
+        "movapd %%xmm0, 0(%[out])\n\t"
+        "movapd %%xmm1, 16(%[out])\n\t"
+        "movapd %%xmm2, 32(%[out])\n\t"
+        "movapd %%xmm3, 48(%[out])\n\t"
+        "movapd %%xmm4, 64(%[out])\n\t"
+        "movapd %%xmm5, 80(%[out])\n\t"
+        "movapd %%xmm6, 96(%[out])\n\t"
+        "movapd %%xmm7, 112(%[out])\n\t"
+        "movapd %%xmm8, 128(%[out])\n\t"
+        "movapd %%xmm9, 144(%[out])\n\t"
+        "movapd %%xmm10, 160(%[out])\n\t"
+        "movapd %%xmm11, 176(%[out])\n\t"
+        "movapd %%xmm12, 192(%[out])\n\t"
+        "movapd %%xmm13, 208(%[out])\n\t"
+        "movapd %%xmm14, 224(%[out])\n\t"
+        "movapd %%xmm15, 240(%[out])\n\t"
+        "stmxcsr (%[mx])\n\t"
+        :
+        : [out] "r"(out), [mx] "r"(mxcsr)
+        : "memory");
+}
+
+static void sse_load_all(const uint64_t image[32])
+{
+    __asm__ volatile(
+        "movapd 0(%[img]), %%xmm0\n\t"
+        "movapd 16(%[img]), %%xmm1\n\t"
+        "movapd 32(%[img]), %%xmm2\n\t"
+        "movapd 48(%[img]), %%xmm3\n\t"
+        "movapd 64(%[img]), %%xmm4\n\t"
+        "movapd 80(%[img]), %%xmm5\n\t"
+        "movapd 96(%[img]), %%xmm6\n\t"
+        "movapd 112(%[img]), %%xmm7\n\t"
+        "movapd 128(%[img]), %%xmm8\n\t"
+        "movapd 144(%[img]), %%xmm9\n\t"
+        "movapd 160(%[img]), %%xmm10\n\t"
+        "movapd 176(%[img]), %%xmm11\n\t"
+        "movapd 192(%[img]), %%xmm12\n\t"
+        "movapd 208(%[img]), %%xmm13\n\t"
+        "movapd 224(%[img]), %%xmm14\n\t"
+        "movapd 240(%[img]), %%xmm15\n\t"
+        :
+        : [img] "r"(image)
+        : "memory");
+}
+
+static char stage_e_buf[8192];
+
+static uint64_t sse_image_a[32] __attribute__((aligned(16)));
+static uint64_t sse_image_b[32] __attribute__((aligned(16)));
+
+/* Runs SSE_ROUNDS stress rounds from `base`; true when every lane of every
+ * round came back exactly start + iterations. */
+static bool sse_rounds_ok(uint64_t base)
+{
+    for (uint32_t round = 0; round < SSE_ROUNDS; round++) {
+        sse_image_fill(sse_image_a, base);
+        sse_lane_stress(sse_image_a, SSE_ITERATIONS);
+        base += SSE_ITERATIONS;
+        if (!sse_image_matches(sse_image_a, base)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* E1: every forked process inherits the exact XMM register file that was live
+ * in its parent at fork(), then all of them run long packed-double loops
+ * concurrently on the same CPU so the 1 kHz timer preempts them in the middle
+ * of their asm blocks. Any save/restore bug shows up as a wrong lane. The
+ * kernel's own fpu stress self-test runs the same loop on all four CPUs. */
+static void test_sse_fork_preempt(void)
+{
+    int64_t pids[SSE_CHILDREN];
+
+    for (int child = 0; child < SSE_CHILDREN; child++) {
+        uint64_t seed = 3000000ULL * (uint64_t)(child + 1);
+
+        sse_image_fill(sse_image_b, seed);
+        int64_t pid = sse_fork_with_live_xmm(sse_image_b, sse_image_a);
+
+        if (pid < 0) {
+            fail(500);
+        }
+        if (!sse_image_matches(sse_image_a, seed)) {
+            if (pid == 0) {
+                user_exit(51);
+            }
+            fail(501);
+        }
+        if (pid == 0) {
+            user_exit(sse_rounds_ok(seed + 100000000ULL) ? 0U : 52U);
+        }
+        pids[child] = pid;
+    }
+
+    if (!sse_rounds_ok(900000000ULL)) {
+        fail(502);
+    }
+
+    for (int child = 0; child < SSE_CHILDREN; child++) {
+        int32_t status = -1;
+
+        if (bsd_wait4((int32_t)pids[child], &status, 0) != pids[child] ||
+            status != 0) {
+            write_text(2, "init: SSE child status ");
+            write_signed(2, status);
+            write_text(2, "\n");
+            fail(503);
+        }
+    }
+
+    write_text(1,
+               "init: SSE XMM0-15 preserved across fork() and preemptive "
+               "switches (4 processes x 4 rounds x 250000 addpd)\n");
+}
+
+static int64_t read_whole(const char *path, char *buf, size_t cap)
+{
+    int64_t fd = bsd_open(path, BSD_O_RDONLY, 0);
+
+    if (fd < 0) {
+        return fd;
+    }
+
+    size_t total = 0;
+
+    while (total + 1 < cap) {
+        int64_t bytes = bsd_read((int32_t)fd, buf + total, cap - 1 - total);
+
+        if (bytes < 0) {
+            (void)bsd_close((int32_t)fd);
+            return bytes;
+        }
+        if (bytes == 0) {
+            break;
+        }
+        total += (size_t)bytes;
+    }
+
+    buf[total] = '\0';
+    (void)bsd_close((int32_t)fd);
+    return (int64_t)total;
+}
+
+static const char *find_text(const char *haystack, const char *needle)
+{
+    size_t length = text_len(needle);
+
+    for (const char *cursor = haystack; *cursor != '\0'; cursor++) {
+        if (str_eq_len(cursor, needle, length)) {
+            return cursor;
+        }
+    }
+    return NULL;
+}
+
+static size_t count_text(const char *haystack, const char *needle)
+{
+    size_t count = 0;
+    size_t length = text_len(needle);
+
+    for (const char *cursor = haystack; *cursor != '\0'; cursor++) {
+        if (str_eq_len(cursor, needle, length)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Prints the line of `text` that starts with `key`. */
+static void echo_line(const char *prefix, const char *text, const char *key)
+{
+    const char *line = find_text(text, key);
+
+    if (line == NULL) {
+        return;
+    }
+
+    size_t length = 0;
+    while (line[length] != '\0' && line[length] != '\n') {
+        length++;
+    }
+
+    write_text(1, prefix);
+    write_all(1, line, length);
+    write_all(1, "\n", 1);
+}
+
+/* E4: the Limine framebuffer and its read-only description arrive as
+ * capabilities 1 and 2. Map both, check the geometry, draw into the
+ * framebuffer, and confirm the rights the kernel attached. */
+static void test_framebuffer_caps(void)
+{
+    native_result_t r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_INFO,
+                                    STAGE_E_INFO_VA, STAGE_E_PROT_WRITE, 0, 0);
+    if (r.status != SYS_ERR_CAP_RIGHTS_USER) {
+        fail(510);
+    }
+
+    r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_INFO, STAGE_E_INFO_VA, 0,
+                    0, 0);
+    if (r.status != 0) {
+        fail(511);
+    }
+
+    const volatile display_info_t *info =
+        (const volatile display_info_t *)(uintptr_t)STAGE_E_INFO_VA;
+
+    if (info->magic != DISPLAY_INFO_MAGIC ||
+        info->version != DISPLAY_INFO_VERSION || info->width == 0 ||
+        info->height == 0 || info->bpp == 0 ||
+        info->pitch < info->width * (info->bpp / 8U) ||
+        info->mapped_bytes < info->size_bytes) {
+        fail(512);
+    }
+
+    uint64_t width = info->width;
+    uint64_t height = info->height;
+    uint64_t pitch = info->pitch;
+    uint64_t bpp = info->bpp;
+    uint64_t mapped = info->mapped_bytes;
+
+    r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_FRAMEBUFFER,
+                    STAGE_E_FB_VA, STAGE_E_PROT_WRITE, 0, 0);
+    if (r.status != 0) {
+        fail(513);
+    }
+
+    /* Zero copy: Ring 3 writes land directly in the device framebuffer. */
+    if (bpp == 32) {
+        volatile uint32_t *row = (volatile uint32_t *)(uintptr_t)STAGE_E_FB_VA;
+        volatile uint32_t *last =
+            (volatile uint32_t *)(uintptr_t)(STAGE_E_FB_VA +
+                                             (height - 1U) * pitch);
+
+        for (uint32_t x = 0; x < 64U; x++) {
+            row[x] = 0x00FF7F00U | x;
+            last[x] = 0x00007FFFU;
+        }
+        for (uint32_t x = 0; x < 64U; x++) {
+            if (row[x] != (0x00FF7F00U | x) || last[x] != 0x00007FFFU) {
+                fail(514);
+            }
+        }
+    }
+
+    if (read_whole("/proc/self/maps", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
+        find_text(stage_e_buf, "rw-s 00000000 00:00 0 [device]") == NULL ||
+        find_text(stage_e_buf, "r--p") == NULL) {
+        fail(515);
+    }
+
+    if (native_call(SYS_VSPACE_UNMAP, STAGE_E_FB_VA, mapped, 0, 0, 0).status !=
+            0 ||
+        native_call(SYS_VSPACE_UNMAP, STAGE_E_INFO_VA, PAGE_BYTES, 0, 0, 0)
+                .status != 0) {
+        fail(516);
+    }
+
+    write_text(1, "init: framebuffer CAP_OBJ_FRAME mapped in Ring 3: ");
+    write_unsigned(1, width);
+    write_text(1, "x");
+    write_unsigned(1, height);
+    write_text(1, "x");
+    write_unsigned(1, bpp);
+    write_text(1, " pitch ");
+    write_unsigned(1, pitch);
+    write_text(1, ", display-info frame read-only, pixels written\n");
+}
+
+/* E2 + E4: QoS syscall, IPC priority inheritance and cross-task capability
+ * grant. The child (a separate task) receives an attenuated endpoint and the
+ * display-info frame through SYS_CAP_GRANT, drops itself to BACKGROUND and
+ * serves one IPC from this INTERACTIVE parent: while it owes the reply its
+ * effective QoS must be INTERACTIVE, and BACKGROUND again afterwards. */
+static void test_qos_ipc_grant(void)
+{
+    native_result_t r = native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_QUERY, 0, 0,
+                                    0);
+    if (r.status != 0 || r.rdx != SYS_QOS_DEFAULT ||
+        r.r8 != SYS_QOS_DEFAULT) {
+        fail(520);
+    }
+    if (native_call(SYS_THREAD_SET_QOS, 0, 3, 0, 0, 0).status !=
+        SYS_ERR_INVAL_USER) {
+        fail(521);
+    }
+    r = native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_INTERACTIVE, 0, 0, 0);
+    if (r.status != 0 || r.rdx != SYS_QOS_INTERACTIVE ||
+        r.r8 != SYS_QOS_INTERACTIVE) {
+        fail(522);
+    }
+
+    r = native_call(SYS_ENDPOINT_CREATE, 0, 0, 0, 0, 0);
+    if (r.status != 0 || r.rdx == 0) {
+        fail(523);
+    }
+    uint64_t endpoint = r.rdx;
+
+    int32_t to_parent[2];
+    int32_t to_child[2];
+
+    if (bsd_pipe(to_parent) != 0 || bsd_pipe(to_child) != 0) {
+        fail(524);
+    }
+
+    int64_t pid = bsd_fork();
+
+    if (pid < 0) {
+        fail(525);
+    }
+
+    if (pid == 0) {
+        /* The child inherited its creator's class. */
+        r = native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_QUERY, 0, 0, 0);
+        if (r.rdx != SYS_QOS_INTERACTIVE) {
+            user_exit(60);
+        }
+        if (native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_BACKGROUND, 0, 0, 0)
+                .status != 0) {
+            user_exit(61);
+        }
+
+        uint64_t task_id = native_call(SYS_TASK_ID, 0, 0, 0, 0, 0).rdx;
+        uint64_t handles[2] = { 0, 0 };
+
+        if (bsd_write(to_parent[1], &task_id, sizeof(task_id)) != 8 ||
+            bsd_read(to_child[0], handles, sizeof(handles)) != 16) {
+            user_exit(62);
+        }
+
+        /* The granted display-info frame is READ-only and cannot be
+         * re-granted (no CAP_RIGHT_GRANT). */
+        if (native_call(SYS_VSPACE_MAP, handles[1], STAGE_E_INFO_VA,
+                        STAGE_E_PROT_WRITE, 0, 0).status !=
+                SYS_ERR_CAP_RIGHTS_USER ||
+            native_call(SYS_CAP_GRANT, handles[1], SYS_CAP_GRANT_SELF,
+                        SYS_CAP_RIGHT_READ, 0, 0).status !=
+                SYS_ERR_CAP_RIGHTS_USER ||
+            native_call(SYS_VSPACE_MAP, handles[1], STAGE_E_INFO_VA, 0, 0, 0)
+                    .status != 0) {
+            user_exit(63);
+        }
+        const volatile display_info_t *info =
+            (const volatile display_info_t *)(uintptr_t)STAGE_E_INFO_VA;
+        if (info->magic != DISPLAY_INFO_MAGIC || info->width == 0) {
+            user_exit(64);
+        }
+
+        r = native_call(SYS_IPC_RECV, handles[0], 0, 0, 0, 0);
+        if (r.status != 0 || r.rsi != 0x5155455354454E44ULL) {
+            user_exit(65);
+        }
+
+        native_result_t during =
+            native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_QUERY, 0, 0, 0);
+
+        if (native_call(SYS_IPC_REPLY, during.rdx, during.r8, info->width,
+                        ~r.rsi, 0).status != 0) {
+            user_exit(66);
+        }
+
+        native_result_t after =
+            native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_QUERY, 0, 0, 0);
+        if (after.rdx != SYS_QOS_BACKGROUND ||
+            after.r8 != SYS_QOS_BACKGROUND) {
+            user_exit(67);
+        }
+        user_exit(0);
+    }
+
+    uint64_t child_task = 0;
+
+    if (bsd_read(to_parent[0], &child_task, sizeof(child_task)) != 8 ||
+        child_task == 0) {
+        fail(526);
+    }
+
+    /* A grant to a task id that does not exist is rejected; real grants are
+     * attenuated to the rights the child needs. */
+    if (native_call(SYS_CAP_GRANT, endpoint, 0x7FFFFFFFULL, SYS_CAP_RIGHT_ALL,
+                    0, 0).status != SYS_ERR_INVAL_USER) {
+        fail(527);
+    }
+    native_result_t ep_grant = native_call(SYS_CAP_GRANT, endpoint, child_task,
+                                           SYS_CAP_RIGHT_READ, 0, 0);
+    native_result_t info_grant =
+        native_call(SYS_CAP_GRANT, DISPLAY_BOOT_CAP_INFO, child_task,
+                    SYS_CAP_RIGHT_READ, 0, 0);
+    if (ep_grant.status != 0 || info_grant.status != 0) {
+        fail(528);
+    }
+
+    uint64_t handles[2] = { ep_grant.rdx, info_grant.rdx };
+    if (bsd_write(to_child[1], handles, sizeof(handles)) != 16) {
+        fail(529);
+    }
+
+    r = native_call(SYS_IPC_CALL, endpoint, 0x5155455354454E44ULL, 0, 0, 0);
+    if (r.status != 0) {
+        fail(530);
+    }
+    /* reply: m0 = server base QoS, m1 = server effective QoS during the call,
+     * m2 = display width seen by the child, m3 = ~request. */
+    if (r.rsi != SYS_QOS_BACKGROUND || r.r8 != SYS_QOS_INTERACTIVE ||
+        r.r9 == 0 || r.r10 != ~0x5155455354454E44ULL) {
+        write_text(2, "init: PI reply base/effective = ");
+        write_unsigned(2, r.rsi);
+        write_text(2, "/");
+        write_unsigned(2, r.r8);
+        write_text(2, "\n");
+        fail(531);
+    }
+
+    int32_t status = -1;
+    if (bsd_wait4((int32_t)pid, &status, 0) != pid || status != 0) {
+        write_text(2, "init: QoS child status ");
+        write_signed(2, status);
+        write_text(2, "\n");
+        fail(532);
+    }
+
+    (void)bsd_close(to_parent[0]);
+    (void)bsd_close(to_parent[1]);
+    (void)bsd_close(to_child[0]);
+    (void)bsd_close(to_child[1]);
+
+    if (native_call(SYS_CAP_DELETE, endpoint, 0, 0, 0, 0).status != 0 ||
+        native_call(SYS_THREAD_SET_QOS, 0, SYS_QOS_DEFAULT, 0, 0, 0).status !=
+            0) {
+        fail(533);
+    }
+
+    write_text(1,
+               "init: SYS_THREAD_SET_QOS + IPC priority inheritance verified "
+               "(background server ran interactive until SYS_IPC_REPLY)\n");
+    write_text(1,
+               "init: SYS_CAP_GRANT moved an attenuated endpoint and the "
+               "display-info frame into another task\n");
+}
+
+/* E3: /proc and /sys from Ring 3. */
+static void test_proc_sys(void)
+{
+    if (read_whole("/proc/meminfo", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
+        find_text(stage_e_buf, "MemTotal:") == NULL ||
+        find_text(stage_e_buf, "PmmFreeFrames:") == NULL) {
+        fail(540);
+    }
+    echo_line("init: /proc/meminfo ", stage_e_buf, "MemFree:");
+
+    if (read_whole("/proc/cpuinfo", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
+        find_text(stage_e_buf, "vendor_id") == NULL) {
+        fail(541);
+    }
+
+    size_t processors = count_text(stage_e_buf, "processor\t: ");
+    const char *cores = find_text(stage_e_buf, "cpu cores\t: ");
+    int64_t reported = 0;
+
+    if (cores != NULL) {
+        char digits[8];
+        size_t n = 0;
+
+        cores += text_len("cpu cores\t: ");
+        while (n + 1 < sizeof(digits) && cores[n] >= '0' && cores[n] <= '9') {
+            digits[n] = cores[n];
+            n++;
+        }
+        digits[n] = '\0';
+        (void)parse_int(digits, &reported);
+    }
+    if (processors == 0 || (int64_t)processors != reported) {
+        fail(542);
+    }
+    write_text(1, "init: /proc/cpuinfo lists ");
+    write_unsigned(1, processors);
+    write_text(1, " online CPU(s)\n");
+
+    if (read_whole("/proc/self/maps", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
+        find_text(stage_e_buf, "r-xp") == NULL ||
+        find_text(stage_e_buf, "rw-p 00000000 00:00 0 [stack]") == NULL) {
+        fail(543);
+    }
+
+    if (read_whole("/proc/self/status", stage_e_buf, sizeof(stage_e_buf)) <=
+            0 ||
+        find_text(stage_e_buf, "Pid:\t1\n") == NULL ||
+        find_text(stage_e_buf, "Name:\tinit") == NULL ||
+        read_whole("/proc/1/status", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
+        find_text(stage_e_buf, "PPid:\t0\n") == NULL ||
+        bsd_open("/proc/4242/status", BSD_O_RDONLY, 0) != -BSD_ENOENT) {
+        fail(544);
+    }
+
+    int64_t fd = bsd_open("/proc", BSD_O_RDONLY, 0);
+    bool saw_self = false;
+    bool saw_init = false;
+
+    if (fd < 0) {
+        fail(545);
+    }
+    for (;;) {
+        bsd_dirent_t entries[4];
+        int64_t bytes = bsd_getdents((int32_t)fd, entries, sizeof(entries));
+
+        if (bytes <= 0) {
+            break;
+        }
+        for (size_t i = 0; i < (size_t)bytes / sizeof(bsd_dirent_t); i++) {
+            saw_self = saw_self || str_eq(entries[i].d_name, "self");
+            saw_init = saw_init || str_eq(entries[i].d_name, "1");
+        }
+    }
+    (void)bsd_close((int32_t)fd);
+    if (!saw_self || !saw_init) {
+        fail(546);
+    }
+
+    if (read_whole("/sys/bus/pci/devices", stage_e_buf, sizeof(stage_e_buf)) <=
+            0 ||
+        find_text(stage_e_buf, "1af4:1001") == NULL ||
+        find_text(stage_e_buf, " bar5=") == NULL) {
+        fail(547);
+    }
+    echo_line("init: /sys/bus/pci/devices ", stage_e_buf, "00:03.0");
+
+    write_text(1,
+               "init: /proc/meminfo, /proc/cpuinfo, /proc/self/{maps,status}, "
+               "/proc/<pid> and /sys/bus/pci/devices verified\n");
+}
+
+static const uint64_t exec_garbage[32] __attribute__((aligned(16))) = {
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL,
+    0xDEADBEEFDEADBEEFULL, 0xDEADBEEFDEADBEEFULL
+};
+
+/* E3: execve() carries envp to the new image (checked by the re-executed init
+ * in envtest_main) and resets the FPU/SSE state the old image left behind. */
+static void test_exec_envp(void)
+{
+    int64_t pid = bsd_fork();
+
+    if (pid < 0) {
+        fail(550);
+    }
+    if (pid == 0) {
+        char *argv[3] = { "init", "--envtest", NULL };
+        char *envp[4] = { "LUCYK_STAGE=E", "HOME=/", "PATH=/bin:/sbin", NULL };
+
+        sse_load_all(exec_garbage);
+        (void)bsd_execve("/bin/init", argv, envp);
+        user_exit(70);
+    }
+
+    int32_t status = -1;
+    if (bsd_wait4((int32_t)pid, &status, 0) != pid || status != 0) {
+        write_text(2, "init: envtest status ");
+        write_signed(2, status);
+        write_text(2, "\n");
+        fail(551);
+    }
+
+    write_text(1,
+               "init: execve envp propagated (argc/argv/NULL/envp/NULL, "
+               "16-byte aligned) and FPU/SSE state reset\n");
+}
+
+static uint64_t envtest_xmm[32] __attribute__((aligned(16)));
+static uint32_t envtest_mxcsr;
+
+/* Entry of "/bin/init --envtest": validates the System V initial stack the
+ * kernel built and the clean FPU image, then exits with a diagnostic code. */
+__attribute__((noreturn)) static void envtest_main(int argc, char **argv,
+                                                   char **envp)
+{
+    for (size_t i = 0; i < 32; i++) {
+        if (envtest_xmm[i] != 0) {
+            user_exit(80);
+        }
+    }
+    if (envtest_mxcsr != 0x1F80U) {
+        user_exit(81);
+    }
+
+    uint64_t *base = (uint64_t *)(void *)argv - 1;
+
+    if (((uintptr_t)base & 15U) != 0 || base[0] != (uint64_t)argc ||
+        argv[argc] != NULL || envp != argv + argc + 1) {
+        user_exit(82);
+    }
+
+    static const char *const expected[3] = {
+        "LUCYK_STAGE=E", "HOME=/", "PATH=/bin:/sbin"
+    };
+
+    for (int i = 0; i < 3; i++) {
+        if (envp[i] == NULL || !str_eq(envp[i], expected[i])) {
+            user_exit(83);
+        }
+    }
+    if (envp[3] != NULL) {
+        user_exit(84);
+    }
+
+    user_exit(0);
+}
+
+static void run_stage_e_tests(void)
+{
+    write_text(1, "init: Stage E tests\n");
+    test_sse_fork_preempt();
+    test_framebuffer_caps();
+    test_qos_ipc_grant();
+    test_proc_sys();
+    test_exec_envp();
+    write_text(1, "init: Stage E automated tests passed\n");
+}
+
 static void print_motd(void)
 {
     int64_t fd = bsd_open("/etc/motd", BSD_O_RDONLY, 0);
@@ -1394,8 +2226,18 @@ static void spawn_shell(void)
     }
 }
 
-void user_main(void)
+void user_main(int argc, char **argv, char **envp)
 {
+    /* Captured before anything else: the --envtest image must observe the
+     * clean FPU/SSE state execve() installs. */
+    sse_store_all(envtest_xmm, &envtest_mxcsr);
+
+    /* PID 1 is entered with argc == 0; only a re-executed init has args. */
+    if (argc == 2 && argv != NULL && argv[1] != NULL &&
+        str_eq(argv[1], "--envtest")) {
+        envtest_main(argc, argv, envp);
+    }
+
     write_text(1, "init: PID 1 online (Kernel Stage C)\n");
 
     if (bsd_getpid() != 1) {
@@ -1435,6 +2277,8 @@ void user_main(void)
     test_ext2_unlink_open();
     test_ext2_concurrent();
     write_text(1, "init: Stage D2 ext2 persistence tests passed\n");
+
+    run_stage_e_tests();
 
     print_motd();
     spawn_shell();

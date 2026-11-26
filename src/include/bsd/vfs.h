@@ -119,6 +119,14 @@ sys_status_t bsd_fd_get(struct bsd_proc *proc, int32_t fd, file_t **out);
 sys_status_t bsd_fd_close(struct bsd_proc *proc, int32_t fd);
 void bsd_fd_close_all(struct bsd_proc *proc);
 
+/* Mounts the virtual /proc and /sys trees (src/bsd/procfs.c) beside /dev.
+ * Requires the root filesystem to be in place. */
+sys_status_t vfs_mount_introspection(void);
+
+/* Permanent root directory vnodes of the introspection filesystems. */
+vnode_t *procfs_root(void);
+vnode_t *sysfs_root(void);
+
 /* Read-only USTAR root filesystem. */
 sys_status_t initrd_mount(const void *image, size_t size);
 

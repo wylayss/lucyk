@@ -25,6 +25,8 @@
 #define PTE_HUGE     (1ULL << 7)
 #define PTE_COW      (1ULL << 9)  /* Software bit: copy-on-write page */
 #define PTE_OWNED    (1ULL << 10) /* Software bit: vspace owns this leaf frame */
+#define PTE_DEVICE   (1ULL << 11) /* Software bit: non-PMM device memory */
+#define PTE_PAT_4K   (1ULL << 7)  /* PAT selector bit of a 4 KiB leaf */
 #define PTE_NX       (1ULL << 63)
 
 #define PTE_ADDR_MASK 0x000FFFFFFFFFF000ULL
@@ -47,8 +49,8 @@ static vspace_t kernel_vspace;
 static spinlock_t vspace_global_lock;
 
 /* Software bits occupy the address mask's low bits? No: the mask keeps only
- * bits 12..51, so PTE_COW (bit 9) and PTE_OWNED (bit 10) never alias a frame
- * address. */
+ * bits 12..51, so PTE_COW (bit 9), PTE_OWNED (bit 10) and PTE_DEVICE (bit 11)
+ * never alias a frame address. */
 
 static void tlb_invalidate(vaddr_t vaddr)
 {
@@ -419,6 +421,16 @@ vspace_t *vspace_clone(vspace_t *src)
                         if (replaced_phys != 0) {
                             pmm_frame_unref(replaced_phys);
                         }
+                    } else if ((pte & PTE_DEVICE) != 0) {
+                        /* Device memory is shared, never copied: the clone
+                         * aliases the same MMIO range with identical cache
+                         * attributes and takes no frame reference. */
+                        uint64_t *dst_slot = walk(dst, vaddr, true, true);
+
+                        if (dst_slot == NULL) {
+                            goto fail;
+                        }
+                        *dst_slot = pte & ~(PTE_ACCESSED | PTE_DIRTY);
                     } else {
                         paddr_t frame = pmm_alloc_frame();
                         if (frame == 0) {
@@ -478,8 +490,38 @@ static bool build_leaf_flags(paddr_t paddr, uint64_t flags, bool user,
         (flags & (VSPACE_PROT_WRITE | VSPACE_PROT_EXEC)) != 0) {
         return false;
     }
+    /* Device memory is never executable, never owned by a vspace and never
+     * copy-on-write; WC is only meaningful for it. */
+    if ((flags & VSPACE_PROT_DEVICE) != 0 &&
+        (flags & (VSPACE_PROT_EXEC | VSPACE_PROT_OWNED | VSPACE_PROT_COW)) !=
+            0) {
+        return false;
+    }
+    if ((flags & VSPACE_PROT_WC) != 0 && (flags & VSPACE_PROT_DEVICE) == 0) {
+        return false;
+    }
 
     uint64_t pte = paddr | PTE_PRESENT;
+
+    if ((flags & VSPACE_PROT_DEVICE) != 0) {
+        pte |= PTE_DEVICE | PTE_NX;
+
+        if ((flags & VSPACE_PROT_WC) != 0) {
+            uint32_t entry = cpu_write_combining_pat_entry();
+
+            if (entry != 0) {
+                pte |= PTE_PAT_4K;
+                if ((entry & 2U) != 0) {
+                    pte |= PTE_PCD;
+                }
+                if ((entry & 1U) != 0) {
+                    pte |= PTE_PWT;
+                }
+            } else {
+                pte |= PTE_PCD | PTE_PWT;
+            }
+        }
+    }
 
     if (user) {
         pte |= PTE_USER;
@@ -1185,6 +1227,13 @@ static sys_status_t copy_user_range(void *kernel_buf, uintptr_t user_addr,
             return SYS_ERR_INVAL;
         }
 
+        /* Device memory is not reachable through the HHDM and must never be
+         * touched by the kernel on a user's behalf. */
+        if ((*slot & PTE_DEVICE) != 0) {
+            vspace_lock_release(lock);
+            return SYS_ERR_INVAL;
+        }
+
         /* A kernel write to a CoW page must break the sharing exactly like a
          * user write fault would; the PTE is replaced, so re-walk it. */
         if (to_user && ((*slot & PTE_WRITABLE) == 0 ||
@@ -1273,6 +1322,12 @@ sys_status_t vspace_remap_user(vspace_t *vs, vaddr_t vaddr, uint64_t new_flags,
     uint64_t old_pte = *slot;
     paddr_t frame = old_pte & PTE_ADDR_MASK;
 
+    /* Device mappings keep the protection they were granted with. */
+    if ((old_pte & PTE_DEVICE) != 0) {
+        vspace_lock_release(lock);
+        return SYS_ERR_INVAL;
+    }
+
     if (old_pte_out != NULL) {
         *old_pte_out = old_pte;
     }
@@ -1325,4 +1380,103 @@ sys_status_t vspace_remap_user(vspace_t *vs, vaddr_t vaddr, uint64_t new_flags,
 
     vspace_lock_release(lock);
     return SYS_OK;
+}
+
+static uint32_t leaf_range_prot(uint64_t pte)
+{
+    uint32_t prot = 0;
+
+    if ((pte & (PTE_WRITABLE | PTE_COW)) != 0) {
+        prot |= VSPACE_PROT_WRITE;
+    }
+    if ((pte & PTE_NX) == 0) {
+        prot |= VSPACE_PROT_EXEC;
+    }
+    if ((pte & PTE_DEVICE) != 0) {
+        prot |= VSPACE_PROT_DEVICE;
+    }
+    return prot;
+}
+
+void vspace_user_ranges(vspace_t *vs,
+                        bool (*fn)(const vspace_range_t *range, void *ctx),
+                        void *ctx)
+{
+    if (vs == NULL || fn == NULL || vs == &kernel_vspace) {
+        return;
+    }
+
+    vspace_range_t run = { 0, 0, 0 };
+    bool open_run = false;
+    bool keep_going = true;
+    uint64_t lock = vspace_lock_acquire();
+
+    for (uint64_t pml4_index = 0;
+         keep_going && pml4_index < KERNEL_PML4_FIRST; pml4_index++) {
+        uint64_t pml4_entry = vs->pml4[pml4_index];
+
+        if ((pml4_entry & PTE_PRESENT) == 0 || (pml4_entry & PTE_HUGE) != 0) {
+            continue;
+        }
+
+        uint64_t *pdpt =
+            (uint64_t *)pmm_phys_to_virt(pml4_entry & PTE_ADDR_MASK);
+
+        for (uint64_t pdpt_index = 0; keep_going && pdpt_index < 512;
+             pdpt_index++) {
+            uint64_t pdpt_entry = pdpt[pdpt_index];
+
+            if ((pdpt_entry & PTE_PRESENT) == 0 ||
+                (pdpt_entry & PTE_HUGE) != 0) {
+                continue;
+            }
+
+            uint64_t *pd =
+                (uint64_t *)pmm_phys_to_virt(pdpt_entry & PTE_ADDR_MASK);
+
+            for (uint64_t pd_index = 0; keep_going && pd_index < 512;
+                 pd_index++) {
+                uint64_t pd_entry = pd[pd_index];
+
+                if ((pd_entry & PTE_PRESENT) == 0 ||
+                    (pd_entry & PTE_HUGE) != 0) {
+                    continue;
+                }
+
+                uint64_t *pt =
+                    (uint64_t *)pmm_phys_to_virt(pd_entry & PTE_ADDR_MASK);
+
+                for (uint64_t pt_index = 0; keep_going && pt_index < 512;
+                     pt_index++) {
+                    uint64_t pte = pt[pt_index];
+
+                    if ((pte & PTE_PRESENT) == 0 || (pte & PTE_USER) == 0) {
+                        continue;
+                    }
+
+                    vaddr_t vaddr = (pml4_index << 39) | (pdpt_index << 30) |
+                                    (pd_index << 21) | (pt_index << 12);
+                    uint32_t prot = leaf_range_prot(pte);
+
+                    if (open_run && run.end == vaddr && run.prot == prot) {
+                        run.end = vaddr + PAGE_SIZE;
+                        continue;
+                    }
+                    if (open_run) {
+                        keep_going = fn(&run, ctx);
+                    }
+                    run.start = vaddr;
+                    run.end = vaddr + PAGE_SIZE;
+                    run.prot = prot;
+                    open_run = true;
+                }
+            }
+        }
+    }
+
+    if (keep_going && open_run) {
+        (void)fn(&run, ctx);
+    }
+
+    vspace_lock_release(lock);
 }

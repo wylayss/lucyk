@@ -50,4 +50,9 @@ void pci_enable_bus_master(pci_device_t *dev);
 size_t pci_device_count(void);
 const pci_device_t *pci_device_at(size_t index);
 
+/* Read-only introspection helper: copies the decoded function at index into
+ * *out. Returns false past the end of the enumerated list. Never touches
+ * configuration space, so callers above src/io/ cannot alter device state. */
+bool pci_device_snapshot(size_t index, pci_device_t *out);
+
 #endif /* LUCYK_IO_PCI_H */

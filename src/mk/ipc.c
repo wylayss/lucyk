@@ -1,5 +1,7 @@
 #include <cap.h>
+#include <cpu.h>
 #include <idt.h>
+#include <ioapic.h>
 #include <io.h>
 #include <ipc.h>
 #include <isr.h>
@@ -8,6 +10,7 @@
 #include <lapic.h>
 #include <object.h>
 #include <sched.h>
+#include <spinlock.h>
 #include <string.h>
 #include <task.h>
 #include <types.h>
@@ -15,13 +18,26 @@
 #define IRQ_VECTOR_MIN 32U
 #define IRQ_VECTOR_MAX 254U
 
+/* Vectors handed to GSI-backed IRQ capabilities. They sit above the kernel's
+ * own device vectors (VirtIO-Blk uses 0x40) and below the IPI range. */
+#define IRQ_CAP_VECTOR_FIRST 0x50U
+#define IRQ_CAP_VECTOR_LAST  0x6FU
+
 typedef struct irq_binding {
-    notification_t *notification;
-    uint64_t        bit;
-    bool            active;
+    notification_t   *notification;
+    uint64_t          bit;
+    bool              active;
+    cap_irq_object_t *gsi_owner; /* GSI-backed capability, or NULL */
 } irq_binding_t;
 
 static irq_binding_t irq_bindings[256];
+
+/* Guards irq_bindings[] and the capability vector pool. The interrupt handler
+ * takes it on whichever CPU the IOAPIC delivers to, so interrupt masking alone
+ * would not exclude a concurrent unbind on another core. Lock order:
+ * irq binding -> ioapic. */
+static spinlock_t irq_binding_lock;
+static uint32_t irq_cap_vectors_used;
 
 static void enqueue(thread_t **head, thread_t **tail, thread_t *thread)
 {
@@ -99,6 +115,7 @@ static void endpoint_mark_destroyed(endpoint_t *endpoint)
         if (thread->reply_target != NULL &&
             thread->reply_target->ipc_sender == thread) {
             thread->reply_target->ipc_sender = NULL;
+            sched_qos_restore(thread->reply_target);
         }
         thread->reply_target = NULL;
         thread->ipc_status = SYS_ERR_DEAD;
@@ -240,6 +257,8 @@ void ipc_thread_detach(thread_t *thread)
 
         if (receiver->ipc_sender == thread) {
             receiver->ipc_sender = NULL;
+            /* The boost was lent by this caller; it ends with the caller. */
+            sched_qos_restore(receiver);
         }
         thread->reply_target = NULL;
     }
@@ -437,6 +456,9 @@ sys_status_t ipc_recv(task_t *task, cap_t ep_cap, uint64_t msg_out[4],
         sender->ipc_wait_kind = IPC_WAIT_REPLY;
         enqueue(&endpoint->reply_queue, &endpoint->reply_tail, sender);
 
+        /* Priority inheritance: the receiver now owes this caller a reply. */
+        sched_qos_inherit(self, sender);
+
         irq_restore(flags);
         mk_object_release(&endpoint->header);
         return SYS_OK;
@@ -509,6 +531,9 @@ sys_status_t ipc_reply(thread_t *caller, const uint64_t reply[4])
     caller->ipc_status = SYS_OK;
     caller->reply_target = NULL;
     receiver->ipc_sender = NULL;
+
+    /* The reply ends the inherited boost before the caller can run again. */
+    sched_qos_restore(receiver);
     sched_wake(caller);
 
     irq_restore(flags);
@@ -619,15 +644,51 @@ static void irq_forward_handler(interrupt_frame_t *frame)
 {
     uint8_t vector = (uint8_t)frame->vector;
 
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
     irq_binding_t *binding = &irq_bindings[vector];
     notification_t *notification = binding->active ? binding->notification : NULL;
     uint64_t bit = binding->bit;
-    irq_restore(flags);
+
+    if (notification != NULL) {
+        cap_irq_object_t *owner = binding->gsi_owner;
+
+        /* Hold the line off until the driver acknowledges; the LAPIC EOI that
+         * isr_dispatch() sends after this handler then cannot re-trigger a
+         * level-asserted source. */
+        if (owner != NULL) {
+            ioapic_mask_irq(owner->gsi);
+            owner->awaiting_ack = true;
+            owner->fire_count++;
+        }
+        mk_object_retain(&notification->header);
+    }
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
 
     if (notification != NULL) {
         notify_signal(notification, bit);
+        mk_object_release(&notification->header);
     }
+}
+
+static sys_status_t bind_vector_locked(uint8_t vector,
+                                       notification_t *notification,
+                                       uint64_t bit, cap_irq_object_t *owner)
+{
+    irq_binding_t *binding = &irq_bindings[vector];
+
+    if (binding->active) {
+        return SYS_ERR_BUSY;
+    }
+
+    mk_object_retain(&notification->header);
+
+    binding->notification = notification;
+    binding->bit = bit;
+    binding->gsi_owner = owner;
+    binding->active = true;
+
+    idt_register_handler(vector, irq_forward_handler);
+    return SYS_OK;
 }
 
 sys_status_t irq_bind_notification(uint8_t vector, notification_t *notification,
@@ -638,24 +699,11 @@ sys_status_t irq_bind_notification(uint8_t vector, notification_t *notification,
         return SYS_ERR_INVAL;
     }
 
-    uint64_t flags = irq_save();
-    irq_binding_t *binding = &irq_bindings[vector];
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
+    sys_status_t status = bind_vector_locked(vector, notification, bit, NULL);
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
 
-    if (binding->active) {
-        irq_restore(flags);
-        return SYS_ERR_BUSY;
-    }
-
-    mk_object_retain(&notification->header);
-
-    binding->notification = notification;
-    binding->bit = bit;
-    binding->active = true;
-
-    idt_register_handler(vector, irq_forward_handler);
-
-    irq_restore(flags);
-    return SYS_OK;
+    return status;
 }
 
 sys_status_t irq_unbind_notification(uint8_t vector)
@@ -664,25 +712,85 @@ sys_status_t irq_unbind_notification(uint8_t vector)
         return SYS_ERR_INVAL;
     }
 
-    uint64_t flags = irq_save();
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
     irq_binding_t *binding = &irq_bindings[vector];
 
     if (!binding->active) {
-        irq_restore(flags);
+        spin_unlock_irqrestore(&irq_binding_lock, flags);
         return SYS_ERR_INVAL;
     }
 
     notification_t *notification = binding->notification;
+    cap_irq_object_t *owner = binding->gsi_owner;
+
+    if (owner != NULL) {
+        ioapic_mask_irq(owner->gsi);
+        owner->bound = false;
+        owner->awaiting_ack = false;
+    }
 
     binding->notification = NULL;
     binding->bit = 0;
+    binding->gsi_owner = NULL;
     binding->active = false;
 
     idt_register_handler(vector, NULL);
 
-    irq_restore(flags);
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
 
     mk_object_release(&notification->header);
+    return SYS_OK;
+}
+
+sys_status_t irq_cap_bind(cap_irq_object_t *irq, notification_t *notification,
+                          uint64_t bit)
+{
+    if (irq == NULL || notification == NULL || notification->destroyed ||
+        bit == 0) {
+        return SYS_ERR_INVAL;
+    }
+    if (!irq->gsi_backed) {
+        sys_status_t status =
+            irq_bind_notification(irq->vector, notification, bit);
+
+        if (status == SYS_OK) {
+            irq->bound = true;
+        }
+        return status;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
+    sys_status_t status =
+        bind_vector_locked(irq->vector, notification, bit, irq);
+
+    if (status == SYS_OK) {
+        irq->bound = true;
+        irq->awaiting_ack = false;
+        ioapic_unmask_irq(irq->gsi);
+    }
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
+
+    return status;
+}
+
+sys_status_t irq_cap_ack(cap_irq_object_t *irq)
+{
+    if (irq == NULL) {
+        return SYS_ERR_INVAL;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
+
+    if (!irq->bound) {
+        spin_unlock_irqrestore(&irq_binding_lock, flags);
+        return SYS_ERR_INVAL;
+    }
+    if (irq->gsi_backed && irq->awaiting_ack) {
+        irq->awaiting_ack = false;
+        ioapic_unmask_irq(irq->gsi);
+    }
+
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
     return SYS_OK;
 }
 
@@ -691,6 +799,15 @@ static void irq_object_release(mk_object_t *object)
     cap_irq_object_t *irq = (cap_irq_object_t *)object;
 
     (void)irq_unbind_notification(irq->vector);
+
+    if (irq->gsi_backed) {
+        ioapic_unbind_cap_irq(irq->gsi);
+
+        uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
+        irq_cap_vectors_used &=
+            ~(1U << (irq->vector - IRQ_CAP_VECTOR_FIRST));
+        spin_unlock_irqrestore(&irq_binding_lock, flags);
+    }
     kfree(irq);
 }
 
@@ -707,6 +824,58 @@ mk_object_t *cap_irq_object_create(uint8_t vector)
 
     memset(irq, 0, sizeof(*irq));
     irq->vector = vector;
+    mk_object_init(&irq->header, CAP_OBJ_IRQ, irq_object_release);
+
+    return &irq->header;
+}
+
+mk_object_t *cap_irq_gsi_object_create(uint8_t gsi, bool active_low,
+                                       bool level_triggered)
+{
+    _Static_assert(IRQ_CAP_VECTOR_LAST - IRQ_CAP_VECTOR_FIRST < 32U,
+                   "capability vector pool must fit the bitmap");
+
+    cap_irq_object_t *irq = (cap_irq_object_t *)kalloc(sizeof(cap_irq_object_t));
+    if (irq == NULL) {
+        return NULL;
+    }
+    memset(irq, 0, sizeof(*irq));
+
+    uint8_t vector = 0;
+    uint64_t flags = spin_lock_irqsave(&irq_binding_lock);
+
+    for (uint32_t v = IRQ_CAP_VECTOR_FIRST; v <= IRQ_CAP_VECTOR_LAST; v++) {
+        uint32_t bit = 1U << (v - IRQ_CAP_VECTOR_FIRST);
+
+        if ((irq_cap_vectors_used & bit) == 0 && !irq_bindings[v].active) {
+            irq_cap_vectors_used |= bit;
+            vector = (uint8_t)v;
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&irq_binding_lock, flags);
+
+    if (vector == 0) {
+        kfree(irq);
+        return NULL;
+    }
+
+    /* External interrupts are delivered to the BSP; the notification wake path
+     * reaches the driver thread on whatever CPU owns it. */
+    cpu_local_t *bsp = cpu_local_for(0);
+    sys_status_t status = ioapic_bind_cap_irq(gsi, vector, bsp->lapic_id,
+                                              active_low, level_triggered);
+    if (status != SYS_OK) {
+        flags = spin_lock_irqsave(&irq_binding_lock);
+        irq_cap_vectors_used &= ~(1U << (vector - IRQ_CAP_VECTOR_FIRST));
+        spin_unlock_irqrestore(&irq_binding_lock, flags);
+        kfree(irq);
+        return NULL;
+    }
+
+    irq->vector = vector;
+    irq->gsi_backed = true;
+    irq->gsi = gsi;
     mk_object_init(&irq->header, CAP_OBJ_IRQ, irq_object_release);
 
     return &irq->header;

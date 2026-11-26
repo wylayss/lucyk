@@ -16,6 +16,174 @@ extern void thread_entry_start(void);
 static uint64_t next_task_id = 1;
 static uint64_t next_thread_id = 1;
 
+/* Every task created through task_create() is linked here so a capability
+ * can be granted to a task named by its id (SYS_CAP_GRANT). Lock order:
+ * task registry -> cap. */
+static task_t *task_registry;
+static spinlock_t task_registry_lock;
+
+_Static_assert(THREAD_FXSAVE_SIZE == 512U, "FXSAVE64 image is 512 bytes");
+
+static void fxsave_image_default(uint8_t *image)
+{
+    memset(image, 0, THREAD_FXSAVE_SIZE);
+
+    /* Legacy FXSAVE layout: FCW at byte 0 (FSW, abridged FTW and FOP stay
+     * zero: empty x87 stack, no pending exceptions), MXCSR at byte 24. XMM0-15
+     * at bytes 160..415 are already zero. */
+    uint16_t fcw = (uint16_t)THREAD_FPU_DEFAULT_FCW;
+    uint32_t mxcsr = (uint32_t)THREAD_FPU_DEFAULT_MXCSR;
+
+    memcpy(image + 0, &fcw, sizeof(fcw));
+    memcpy(image + 24, &mxcsr, sizeof(mxcsr));
+}
+
+static uint8_t *fxsave_aligned(thread_t *thread)
+{
+    uintptr_t raw = (uintptr_t)thread->fxsave_storage;
+
+    return (uint8_t *)(uintptr_t)ALIGN_UP(raw, THREAD_FXSAVE_ALIGN);
+}
+
+void thread_fpu_init(thread_t *thread)
+{
+    if (thread == NULL) {
+        return;
+    }
+
+    thread->fxsave_area = fxsave_aligned(thread);
+    if (((uintptr_t)thread->fxsave_area & (THREAD_FXSAVE_ALIGN - 1U)) != 0) {
+        kpanic("thread: FXSAVE area %p is not 16-byte aligned",
+               thread->fxsave_area);
+    }
+    fxsave_image_default(thread->fxsave_area);
+}
+
+/* Captures the live FPU/SSE registers of the calling CPU into image. The
+ * kernel is built without SSE code generation, so whatever the registers hold
+ * here still belongs to the thread that entered the kernel. */
+static void fxsave_live(uint8_t *image)
+{
+    __asm__ volatile("fxsave64 %0"
+                     : "=m"(*(uint8_t(*)[THREAD_FXSAVE_SIZE])image)
+                     :
+                     : "memory");
+}
+
+static void fxrstor_live(const uint8_t *image)
+{
+    __asm__ volatile("fxrstor64 %0"
+                     :
+                     : "m"(*(const uint8_t(*)[THREAD_FXSAVE_SIZE])image)
+                     : "memory");
+}
+
+void thread_fpu_reset_current(void)
+{
+    uint64_t flags = irq_save();
+    thread_t *self = sched_current_thread();
+
+    if (self != NULL && self->fxsave_area != NULL) {
+        /* Interrupts stay off between the two steps: a context switch in the
+         * middle would save the stale live registers over the clean image. */
+        fxsave_image_default(self->fxsave_area);
+        fxrstor_live(self->fxsave_area);
+    }
+
+    irq_restore(flags);
+}
+
+sys_status_t thread_set_qos(thread_t *thread, uint32_t qos)
+{
+    if (thread == NULL || qos >= THREAD_QOS_COUNT) {
+        return SYS_ERR_INVAL;
+    }
+
+    sched_qos_set_base(thread, (uint8_t)qos);
+    return SYS_OK;
+}
+
+thread_t *task_find_thread(task_t *task, uint64_t tid)
+{
+    thread_t *self = sched_current_thread();
+
+    if (task == NULL) {
+        return NULL;
+    }
+    if (tid == 0) {
+        return (self != NULL && self->owner_task == task) ? self : NULL;
+    }
+
+    thread_t *found = NULL;
+    uint64_t flags = spin_lock_irqsave(&task->thread_lock);
+
+    for (thread_t *thread = task->threads; thread != NULL;
+         thread = thread->task_next) {
+        if (thread->tid == tid && thread->state != THREAD_DEAD) {
+            found = thread;
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&task->thread_lock, flags);
+    return found;
+}
+
+sys_status_t task_with_id(uint64_t task_id,
+                          sys_status_t (*fn)(task_t *target, void *ctx),
+                          void *ctx)
+{
+    if (fn == NULL || task_id == 0) {
+        return SYS_ERR_INVAL;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&task_registry_lock);
+    task_t *target = task_registry;
+
+    while (target != NULL && target->id != task_id) {
+        target = target->registry_next;
+    }
+
+    sys_status_t status;
+
+    if (target == NULL) {
+        status = SYS_ERR_INVAL;
+    } else if (target->terminating || target->caps == NULL) {
+        status = SYS_ERR_DEAD;
+    } else {
+        status = fn(target, ctx);
+    }
+
+    spin_unlock_irqrestore(&task_registry_lock, flags);
+    return status;
+}
+
+static void task_registry_insert(task_t *task)
+{
+    uint64_t flags = spin_lock_irqsave(&task_registry_lock);
+
+    task->registry_next = task_registry;
+    task_registry = task;
+
+    spin_unlock_irqrestore(&task_registry_lock, flags);
+}
+
+static void task_registry_remove(task_t *task)
+{
+    uint64_t flags = spin_lock_irqsave(&task_registry_lock);
+    task_t **link = &task_registry;
+
+    while (*link != NULL && *link != task) {
+        link = &(*link)->registry_next;
+    }
+    if (*link == task) {
+        *link = task->registry_next;
+    }
+    task->registry_next = NULL;
+
+    spin_unlock_irqrestore(&task_registry_lock, flags);
+}
+
 task_t *task_create(void)
 {
     task_t *task = (task_t *)kalloc(sizeof(task_t));
@@ -47,6 +215,7 @@ task_t *task_create(void)
     spinlock_init(&task->thread_lock);
     irq_restore(flags);
 
+    task_registry_insert(task);
     return task;
 }
 
@@ -77,7 +246,13 @@ void task_destroy(task_t *task)
         irq_restore(flags);
         kpanic("task_destroy: task %lu still owns threads", task->id);
     }
+    irq_restore(flags);
 
+    /* Unpublish first: once the registry no longer names this task, no
+     * cross-task grant can be inserting into its capability table. */
+    task_registry_remove(task);
+
+    flags = irq_save();
     vspace_t *vspace = task->vspace;
     cap_table_t *caps = task->caps;
 
@@ -96,7 +271,7 @@ void task_destroy(task_t *task)
 
 static thread_t *thread_create_internal(task_t *task,
                                         void (*entry)(void *arg), void *arg,
-                                        uint64_t fs_base)
+                                        uint64_t fs_base, bool inherit_fpu)
 {
     if (task == NULL || entry == NULL) {
         return NULL;
@@ -123,6 +298,23 @@ static thread_t *thread_create_internal(task_t *task,
     thread->entry = entry;
     thread->arg = arg;
     thread->fs_base = fs_base;
+    thread->base_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    thread->effective_qos = (uint8_t)THREAD_QOS_DEFAULT;
+    thread->inherited_qos = (uint8_t)THREAD_QOS_NONE;
+    thread->qos_age = 0;
+
+    thread_fpu_init(thread);
+    if (inherit_fpu) {
+        thread_t *creator = sched_current_thread();
+
+        /* Inherit the creator's live register state, and its QoS class, so
+         * the duplicate resumes with exactly the context it was cloned from. */
+        fxsave_live(thread->fxsave_area);
+        if (creator != NULL) {
+            thread->base_qos = creator->base_qos;
+            thread->effective_qos = creator->base_qos;
+        }
+    }
 
     cpu_context_t *ctx =
         (cpu_context_t *)(uintptr_t)(thread->kstack_top - sizeof(cpu_context_t));
@@ -151,14 +343,20 @@ static thread_t *thread_create_internal(task_t *task,
 
 thread_t *thread_create(task_t *task, void (*entry)(void *arg), void *arg)
 {
-    return thread_create_internal(task, entry, arg, 0);
+    return thread_create_internal(task, entry, arg, 0, false);
 }
 
 thread_t *thread_create_with_fs_base(task_t *task,
                                       void (*entry)(void *arg), void *arg,
                                       uint64_t fs_base)
 {
-    return thread_create_internal(task, entry, arg, fs_base);
+    return thread_create_internal(task, entry, arg, fs_base, false);
+}
+
+thread_t *thread_create_inheriting(task_t *task, void (*entry)(void *arg),
+                                   void *arg, uint64_t fs_base)
+{
+    return thread_create_internal(task, entry, arg, fs_base, true);
 }
 
 NORETURN void thread_entry_c(thread_t *thread)

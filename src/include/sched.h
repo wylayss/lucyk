@@ -11,8 +11,21 @@ void sched_tick(void);
 thread_t *sched_current_thread(void);
 
 /* Switches directly to next. The caller is expected to have set its own state
- * to a blocked state (for example THREAD_BLOCKED_REPLY). */
+ * to a blocked state (for example THREAD_BLOCKED_REPLY). A caller blocked in
+ * THREAD_BLOCKED_REPLY on `next` lends `next` its effective QoS first
+ * (priority inheritance, undone by sched_qos_restore()). */
 void sched_handoff(thread_t *next);
+
+/* QoS bookkeeping (see THREAD_QOS_* in task.h). effective_qos is always
+ * max(base_qos, inherited boost). */
+void sched_qos_set_base(thread_t *thread, uint8_t qos);
+
+/* Raises server's effective QoS to at least client's effective QoS for as
+ * long as server owes client a reply. */
+void sched_qos_inherit(thread_t *server, const thread_t *client);
+
+/* Drops any inherited boost and falls back to server's base QoS. */
+void sched_qos_restore(thread_t *server);
 
 /* Parks the current thread in its already-set blocked state and switches to
  * the next runnable worker, or to the idle context when none is ready. */
@@ -56,8 +69,12 @@ uint64_t sched_cpu_dispatch_count(uint32_t cpu_index);
 NORETURN void boot_stack_enter(uint64_t stack_top, void (*entry)(void));
 
 /* Implemented in src/arch/x86_64/switch.asm. new_cr3 == 0 keeps the current
- * address space; otherwise CR3 is reloaded and TSS.rsp0 is always updated. */
+ * address space; otherwise CR3 is reloaded and TSS.rsp0 is always updated.
+ * The outgoing FPU/SSE registers are saved with FXSAVE64 into old_fx and the
+ * incoming ones restored with FXRSTOR64 from new_fx (NULL skips either step;
+ * both areas must be 16-byte aligned). */
 void switch_context(cpu_context_t **old_ctx, cpu_context_t *new_ctx,
-                    uint64_t new_rsp0, uint64_t new_cr3);
+                    uint64_t new_rsp0, uint64_t new_cr3, uint8_t *old_fx,
+                    const uint8_t *new_fx);
 
 #endif /* LUCYK_SCHED_H */

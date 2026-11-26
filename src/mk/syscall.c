@@ -106,28 +106,145 @@ static void dispatch_frame_map(task_t *task, syscall_frame_t *frame)
 
     cap_frame_object_t *frame_object = (cap_frame_object_t *)object;
 
-    /* Transfer frame ownership to the vspace. This prevents a later cap delete
-     * from freeing a frame that remains mapped, and prevents a second map of
-     * the same frame capability from claiming the same physical frame twice. */
-    uint64_t map_flags = irq_save();
-    if (frame_object->transferred) {
-        irq_restore(map_flags);
-        mk_object_release(&frame_object->header);
-        frame->rax = SYS_ERR_BUSY;
+    status = cap_frame_map(frame_object, task->vspace, vaddr, prot);
+    mk_object_release(&frame_object->header);
+    frame->rax = status;
+}
+
+_Static_assert(SYS_QOS_BACKGROUND == THREAD_QOS_BACKGROUND &&
+                   SYS_QOS_DEFAULT == THREAD_QOS_DEFAULT &&
+                   SYS_QOS_INTERACTIVE == THREAD_QOS_INTERACTIVE,
+               "SYS_QOS_* must match THREAD_QOS_*");
+
+/* SYS_THREAD_SET_QOS(tid, qos): tid 0 is the caller, otherwise a thread of
+ * the calling task. Returns the base class in rdx and the effective class
+ * (base or inherited, whichever is higher) in r8. */
+static void dispatch_thread_set_qos(task_t *task, syscall_frame_t *frame)
+{
+    thread_t *target = task_find_thread(task, frame->rdi);
+
+    if (target == NULL) {
+        frame->rax = SYS_ERR_INVAL;
         return;
     }
-    frame_object->transferred = true;
-    irq_restore(map_flags);
 
-    status = vspace_map_user(task->vspace, vaddr, frame_object->phys,
-                             prot | VSPACE_PROT_USER | VSPACE_PROT_OWNED);
-    if (status != SYS_OK) {
-        map_flags = irq_save();
-        frame_object->transferred = false;
-        irq_restore(map_flags);
+    if (frame->rsi != SYS_QOS_QUERY) {
+        if (frame->rsi >= THREAD_QOS_COUNT) {
+            frame->rax = SYS_ERR_INVAL;
+            return;
+        }
+
+        sys_status_t status = thread_set_qos(target, (uint32_t)frame->rsi);
+        if (status != SYS_OK) {
+            frame->rax = status;
+            return;
+        }
     }
 
-    mk_object_release(&frame_object->header);
+    frame->rax = SYS_OK;
+    frame->rdx = __atomic_load_n(&target->base_qos, __ATOMIC_RELAXED);
+    frame->r8 = __atomic_load_n(&target->effective_qos, __ATOMIC_RELAXED);
+}
+
+typedef struct grant_request {
+    cap_table_t *source;
+    cap_t        cap;
+    uint64_t     rights;
+    cap_t        installed;
+} grant_request_t;
+
+static sys_status_t grant_into_task(task_t *target, void *ctx)
+{
+    grant_request_t *request = (grant_request_t *)ctx;
+
+    return cap_grant_rights(request->source, request->cap, target->caps,
+                            request->rights, &request->installed);
+}
+
+/* SYS_CAP_GRANT(src, target_task_id, rights): copies src (which must carry
+ * CAP_RIGHT_GRANT) into the target task's table with rights & src.rights.
+ * target_task_id 0 duplicates within the caller. rdx returns the handle in
+ * the target's table. */
+static void dispatch_cap_grant(task_t *task, syscall_frame_t *frame)
+{
+    grant_request_t request = {
+        .source = task->caps,
+        .cap = (cap_t)frame->rdi,
+        .rights = frame->rdx,
+        .installed = CAP_NULL,
+    };
+    sys_status_t status;
+
+    if (frame->rsi == SYS_CAP_GRANT_SELF || frame->rsi == task->id) {
+        status = cap_grant_rights(task->caps, request.cap, task->caps,
+                                  request.rights, &request.installed);
+    } else {
+        status = task_with_id(frame->rsi, grant_into_task, &request);
+    }
+
+    frame->rax = status;
+    if (status == SYS_OK) {
+        frame->rdx = (uint64_t)request.installed;
+    }
+}
+
+static void install_new_object(task_t *task, cap_obj_type_t type,
+                               mk_object_t *object, syscall_frame_t *frame)
+{
+    if (object == NULL) {
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    cap_t cap = CAP_NULL;
+    sys_status_t status =
+        cap_insert(task->caps, type, object, CAP_RIGHT_ALL, 0, &cap);
+
+    /* The table holds its own reference; drop the creator's. */
+    mk_object_release(object);
+
+    frame->rax = status;
+    if (status == SYS_OK) {
+        frame->rdx = (uint64_t)cap;
+    }
+}
+
+/* SYS_IRQ_BIND(irq, ntf, bit): both capabilities need CAP_RIGHT_WRITE. */
+static void dispatch_irq_bind(task_t *task, syscall_frame_t *frame)
+{
+    void *irq_object = NULL;
+    void *ntf_object = NULL;
+    sys_status_t status = cap_lookup_retained(task->caps, (cap_t)frame->rdi,
+                                              CAP_OBJ_IRQ, CAP_RIGHT_WRITE,
+                                              &irq_object, NULL);
+    if (status != SYS_OK) {
+        frame->rax = status;
+        return;
+    }
+
+    status = cap_lookup_retained(task->caps, (cap_t)frame->rsi,
+                                 CAP_OBJ_NOTIFICATION, CAP_RIGHT_WRITE,
+                                 &ntf_object, NULL);
+    if (status == SYS_OK) {
+        status = irq_cap_bind((cap_irq_object_t *)irq_object,
+                              (notification_t *)ntf_object, frame->rdx);
+        mk_object_release((mk_object_t *)ntf_object);
+    }
+
+    mk_object_release((mk_object_t *)irq_object);
+    frame->rax = status;
+}
+
+static void dispatch_irq_ack(task_t *task, syscall_frame_t *frame)
+{
+    void *irq_object = NULL;
+    sys_status_t status = cap_lookup_retained(task->caps, (cap_t)frame->rdi,
+                                              CAP_OBJ_IRQ, CAP_RIGHT_WRITE,
+                                              &irq_object, NULL);
+    if (status == SYS_OK) {
+        status = irq_cap_ack((cap_irq_object_t *)irq_object);
+        mk_object_release((mk_object_t *)irq_object);
+    }
     frame->rax = status;
 }
 
@@ -220,6 +337,43 @@ void syscall_dispatch(syscall_frame_t *frame)
         frame->rax = SYS_OK;
         break;
 
+    case SYS_THREAD_SET_QOS:
+        dispatch_thread_set_qos(task, frame);
+        break;
+
+    case SYS_TASK_ID:
+        /* The caller's task id (the SYS_CAP_GRANT target selector) in rdx
+         * and its thread id in r8. */
+        frame->rax = SYS_OK;
+        frame->rdx = task->id;
+        frame->r8 = current->tid;
+        break;
+
+    case SYS_ENDPOINT_CREATE: {
+        endpoint_t *endpoint = endpoint_create();
+
+        install_new_object(task, CAP_OBJ_ENDPOINT,
+                           endpoint != NULL ? &endpoint->header : NULL, frame);
+        break;
+    }
+
+    case SYS_NOTIFY_CREATE: {
+        notification_t *notification = notification_create();
+
+        install_new_object(task, CAP_OBJ_NOTIFICATION,
+                           notification != NULL ? &notification->header : NULL,
+                           frame);
+        break;
+    }
+
+    case SYS_IRQ_BIND:
+        dispatch_irq_bind(task, frame);
+        break;
+
+    case SYS_IRQ_ACK:
+        dispatch_irq_ack(task, frame);
+        break;
+
     case SYS_IPC_CALL:
         dispatch_ipc_call(task, frame);
         break;
@@ -268,18 +422,9 @@ void syscall_dispatch(syscall_frame_t *frame)
         break;
     }
 
-    case SYS_CAP_GRANT: {
-        /* User-visible grants duplicate within the calling task; a task
-         * capability is not yet exposed by this ABI. */
-        cap_t new_cap = CAP_NULL;
-        sys_status_t status = cap_grant(task->caps, (cap_t)frame->rdi,
-                                         task->caps, &new_cap);
-        frame->rax = status;
-        if (status == SYS_OK) {
-            frame->rdx = (uint64_t)new_cap;
-        }
+    case SYS_CAP_GRANT:
+        dispatch_cap_grant(task, frame);
         break;
-    }
 
     case SYS_CAP_DELETE:
         frame->rax = cap_delete(task->caps, (cap_t)frame->rdi);

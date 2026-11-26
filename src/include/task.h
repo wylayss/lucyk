@@ -35,6 +35,25 @@ typedef struct cpu_context {
 #define IPC_WAIT_REPLY  3U
 #define IPC_WAIT_NOTIFY 4U
 
+/* Quality-of-service classes. A higher value is dispatched first; the
+ * scheduler ages lower classes so they keep making bounded forward progress
+ * (see sched.c). THREAD_QOS_NONE marks "no inherited boost". */
+#define THREAD_QOS_BACKGROUND  0U
+#define THREAD_QOS_DEFAULT     1U
+#define THREAD_QOS_INTERACTIVE 2U
+#define THREAD_QOS_COUNT       3U
+#define THREAD_QOS_NONE        0xFFU
+
+/* x87/SSE register image saved by FXSAVE64 and restored by FXRSTOR64. Both
+ * instructions fault (#GP) on an address that is not 16-byte aligned, so each
+ * thread carries a little slack and fxsave_area points at the aligned part. */
+#define THREAD_FXSAVE_SIZE  512U
+#define THREAD_FXSAVE_ALIGN 16U
+
+/* Power-on defaults loaded into every new FPU/SSE image. */
+#define THREAD_FPU_DEFAULT_FCW   0x037FU
+#define THREAD_FPU_DEFAULT_MXCSR 0x1F80U
+
 struct task;
 
 typedef struct thread {
@@ -60,6 +79,12 @@ typedef struct thread {
     struct thread  *sched_next;
     struct thread  *wait_next;
     struct thread  *task_next;
+    uint8_t         base_qos;       /* QoS class requested for the thread */
+    uint8_t         effective_qos;  /* max(base_qos, inherited_qos) */
+    uint8_t         inherited_qos;  /* IPC priority-inheritance boost */
+    uint32_t        qos_age;        /* Dispatches lost to higher classes */
+    uint8_t        *fxsave_area;    /* 16-byte aligned view into storage */
+    uint8_t         fxsave_storage[THREAD_FXSAVE_SIZE + THREAD_FXSAVE_ALIGN];
 } thread_t;
 
 /* Task CPU placement. A task whose threads exchange messages must live on one
@@ -79,6 +104,7 @@ typedef struct task {
     spinlock_t    thread_lock;  /* Guards threads[] and thread_count */
     bool          terminating;
     void         *personality_data;
+    struct task  *registry_next; /* Global task registry link (task.c) */
 } task_t;
 
 task_t *task_create(void);
@@ -97,6 +123,39 @@ thread_t *thread_create(task_t *task, void (*entry)(void *arg), void *arg);
 thread_t *thread_create_with_fs_base(task_t *task,
                                       void (*entry)(void *arg), void *arg,
                                       uint64_t fs_base);
+
+/* Creates a thread that starts with a copy of the calling thread's live
+ * FPU/SSE register state and the given TLS base, both published before the
+ * thread can be scheduled on any CPU. Used when a personality duplicates the
+ * calling context into a new task. */
+thread_t *thread_create_inheriting(task_t *task, void (*entry)(void *arg),
+                                   void *arg, uint64_t fs_base);
+
+/* Points thread->fxsave_area at the 16-byte aligned part of its storage and
+ * loads the clean default image (FCW 0x037F, MXCSR 0x1F80, XMM0-15 zeroed).
+ * Every thread_t, including static and per-CPU idle contexts, goes through
+ * this before its first context switch. */
+void thread_fpu_init(thread_t *thread);
+
+/* Replaces the calling thread's FPU/SSE state, both the saved image and the
+ * live registers, with the clean default. Used when a personality loads a new
+ * program image into the calling task. */
+void thread_fpu_reset_current(void);
+
+/* Sets the base QoS class of `thread` (THREAD_QOS_*) and recomputes its
+ * effective class. Returns SYS_ERR_INVAL for an unknown class. */
+sys_status_t thread_set_qos(thread_t *thread, uint32_t qos);
+
+/* Finds a live thread of `task` by thread id; tid 0 names the caller. */
+thread_t *task_find_thread(task_t *task, uint64_t tid);
+
+/* Runs fn(target, ctx) for the live task whose id is `task_id` with the task
+ * registry locked, so the target cannot be destroyed while fn runs. Returns
+ * SYS_ERR_INVAL when no such task exists and SYS_ERR_DEAD when it is being
+ * torn down; otherwise fn's status. fn must not block. */
+sys_status_t task_with_id(uint64_t task_id,
+                          sys_status_t (*fn)(task_t *target, void *ctx),
+                          void *ctx);
 
 NORETURN void thread_exit(void);
 void thread_yield(void);

@@ -262,6 +262,14 @@ static bsd_proc_t *spawn_init(void)
         }
     }
 
+    /* Zero-copy display handoff: the framebuffer and display-info frames
+     * become capabilities 1 and 2 of PID 1 before its first instruction. */
+    if (bsd_proc_install_boot_caps(proc) != SYS_OK) {
+        klog(KLOG_ERROR, "bsd: cannot install boot capabilities into PID 1");
+        discard_init(task, proc);
+        return NULL;
+    }
+
     console_set_foreground(1);
     console_set_foreground_pgid(1);
 
@@ -397,6 +405,9 @@ void bsd_init(const bsd_module_t *modules, size_t module_count)
     }
     if (vfs_mount("/dev/console", console_vnode()) != SYS_OK) {
         kpanic("bsd: cannot mount /dev/console");
+    }
+    if (vfs_mount_introspection() != SYS_OK) {
+        kpanic("bsd: cannot mount /proc and /sys");
     }
 
     mk_register_hooks(bsd_proc_get_hooks());
