@@ -2,6 +2,7 @@
 #define LUCYK_CPU_H
 
 #include <gdt.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #define CPU_INDEX_NONE 0xFFFFFFFFU
@@ -62,7 +63,16 @@ static inline cpu_local_t *this_cpu(void)
 /* Detects SMEP/SMAP through CPUID and enables the supported CR4 bits. */
 void cpu_init_security_features(void);
 
-/* Enables NXE, CR0.WP, SMEP and SMAP on an Application Processor. */
+/* Enables NXE, CR0.WP, SMEP and SMAP on an Application Processor, plus the
+ * same x87/SSE (CR0.MP/EM/TS, CR4.OSFXSR/OSXMMEXCPT, FNINIT, MXCSR 0x1F80)
+ * and PAT setup the BSP receives from cpu_init_security_features(). */
 void cpu_init_ap_features(void);
+
+/* IA32_PAT entry (4..7) that selects write-combining on every CPU, or 0 when
+ * PAT is unavailable and device mappings fall back to uncached. */
+uint32_t cpu_write_combining_pat_entry(void);
+
+/* CPUID leaf 0 vendor identification ("GenuineIntel", "AuthenticAMD", ...). */
+void cpu_vendor_string(char out[13]);
 
 #endif /* LUCYK_CPU_H */
