@@ -11,6 +11,13 @@
 #define VSPACE_PROT_PWT   (1U << 4) /* Page-level write-through */
 #define VSPACE_PROT_OWNED (1U << 5) /* Internal: the vspace owns the leaf frame */
 #define VSPACE_PROT_COW   (1U << 6) /* Software: copy-on-write, mapped read-only */
+/* Device/MMIO memory outside PMM management (e.g. a linear framebuffer): never
+ * OWNED, never executable, never reference counted or freed, shared (not
+ * copied) by vspace_clone(), and refused by copy_from_user()/copy_to_user(). */
+#define VSPACE_PROT_DEVICE (1U << 7)
+/* Write-combining cache type through the PAT entry chosen by cpu.c; falls
+ * back to uncached (PCD|PWT) when the CPU has no PAT. Device mappings only. */
+#define VSPACE_PROT_WC     (1U << 8)
 
 /* Dedicated higher-half window for guarded per-thread kernel stacks. Each slot
  * is five 4 KiB pages: one unmapped guard page followed by 16 KiB of RW/NX
@@ -144,5 +151,21 @@ sys_status_t copy_to_user(void *udst, const void *ksrc, size_t len);
  * for TLB shootdown after the PTE mutation. */
 sys_status_t vspace_remap_user(vspace_t *vs, vaddr_t vaddr, uint64_t new_flags,
                                paddr_t *old_phys_out, uint64_t *old_pte_out);
+
+/* One maximal run of present user pages sharing the same protection, as
+ * reported by vspace_user_ranges(). prot holds VSPACE_PROT_WRITE (writable
+ * or copy-on-write), VSPACE_PROT_EXEC and VSPACE_PROT_DEVICE. */
+typedef struct vspace_range {
+    vaddr_t  start;
+    vaddr_t  end;   /* Exclusive */
+    uint32_t prot;
+} vspace_range_t;
+
+/* Walks the lower-half user mappings of vs in ascending address order and
+ * calls fn once per coalesced range; a false return stops the walk. fn runs
+ * with the page-table lock held, so it must not block or take other locks. */
+void vspace_user_ranges(vspace_t *vs,
+                        bool (*fn)(const vspace_range_t *range, void *ctx),
+                        void *ctx);
 
 #endif /* LUCYK_VSPACE_H */
