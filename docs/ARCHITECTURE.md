@@ -20,7 +20,7 @@ This system follows a **Modular Hybrid-Ready Microkernel** design. The **Microke
                                      v
 +-------------------------------------------------------------------+
 |                     Microkernel Core (src/mk/)                    |
-|  - Task & Thread Engine (preemptive per-CPU round-robin)          |
+|  - Task & Thread Engine (preemptive per-CPU QoS, eager FPU/SSE)   |
 |  - VSpace Manager (4-level paging, W^X, address isolation, CoW)   |
 |  - Capability & IPC Engine (synchronous endpoints & notifications)|
 |  - Kernel Heap (kalloc) & Diagnostic Logger (klog)                |
@@ -53,13 +53,14 @@ LucyK/
 ├── src/
 │   ├── kernel_main.c         # Higher-half entry & subsystem bootstrap
 │   ├── include/              # Public headers
+│   │   ├── display.h         #   boot display_info_t ABI (framebuffer handoff)
 │   │   ├── io/               #   blkdev.h, pci.h
 │   │   └── bsd/              #   bsd.h, console.h, errno.h, ext2.h, mmap.h,
 │   │                         #   proc.h, syscall_bsd.h, vfs.h
 │   ├── mk/                   # Microkernel core (personality-neutral)
 │   │   ├── task.c            #   task_t / thread_t lifecycle
-│   │   ├── sched.c           #   preemptive scheduler, idle, reaping
-│   │   ├── cap.c             #   capability tables & rights
+│   │   ├── sched.c           #   QoS scheduler, aging, priority inheritance
+│   │   ├── cap.c             #   capability tables, grants, frame kinds, boot caps
 │   │   ├── ipc.c             #   endpoints, notifications, IRQ binding
 │   │   ├── kalloc.c          #   page-backed kernel heap
 │   │   ├── klog.c            #   serial logging & kpanic
@@ -71,7 +72,7 @@ LucyK/
 │   │   ├── idt.c / isr.asm   #   IDT & exception/IRQ stubs
 │   │   ├── pmm.c             #   physical frame bitmap allocator
 │   │   ├── vspace.c          #   4-level paging, CoW, TLB shootdown
-│   │   ├── cpu.c             #   per-CPU GS block, SMEP/SMAP
+│   │   ├── cpu.c             #   per-CPU GS block, SMEP/SMAP, x87/SSE, PAT
 │   │   ├── smp.c             #   AP bringup, IPIs, shootdown protocol
 │   │   ├── ap_trampoline.asm #   16->32->64-bit AP bootstrap (flat binary)
 │   │   ├── ap_image.asm      #   embeds the trampoline blob
@@ -79,7 +80,7 @@ LucyK/
 │   │   ├── ioapic.c          #   IOAPIC routing & ISA overrides
 │   │   ├── lapic.c           #   Local APIC & preemption timer
 │   │   ├── serial.c          #   COM1 UART
-│   │   ├── switch.asm        #   context switch
+│   │   ├── switch.asm        #   context switch + FXSAVE64/FXRSTOR64
 │   │   └── syscall.asm / syscall.c  # SYSCALL/SYSRET entry & MSRs
 │   ├── io/                   # Hardware I/O & block storage (below src/bsd/)
 │   │   ├── pci.c             #   PCI configuration scanner
@@ -88,6 +89,7 @@ LucyK/
 │       ├── bsd_init.c        #   mounts root, registers hooks, spawns PID 1
 │       ├── proc.c            #   process model, signals, pgid, fork/exec/wait4
 │       ├── vfs.c             #   path resolution, fd table, pipes
+│       ├── procfs.c          #   virtual /proc and /sys trees
 │       ├── ext2.c            #   writable ext2 filesystem
 │       ├── initrd.c          #   read-only USTAR fallback root
 │       ├── console.c         #   COM1-backed /dev/console
@@ -201,9 +203,19 @@ typedef struct thread {
     struct thread  *sched_next;
     struct thread  *wait_next;       /* Endpoint/notification wait-queue link */
     struct thread  *task_next;       /* Parent task thread-list link */
+    uint8_t         base_qos;        /* THREAD_QOS_* requested */
+    uint8_t         effective_qos;   /* max(base_qos, inherited_qos) */
+    uint8_t         inherited_qos;   /* IPC priority-inheritance boost */
+    uint32_t        qos_age;         /* Dispatches lost to higher classes */
+    uint8_t        *fxsave_area;     /* 16-byte aligned view into storage */
+    uint8_t         fxsave_storage[512 + 16]; /* FXSAVE64 image + alignment slack */
 } thread_t;
 ```
-`thread_create_with_fs_base()` publishes the inherited TLS base before the thread can be scheduled on any CPU (used by `fork()`).
+`thread_create_with_fs_base()` publishes the inherited TLS base before the thread can be scheduled on any CPU. `thread_create_inheriting()` additionally copies the creator's live FPU/SSE registers and base QoS (used by `fork()`); `thread_fpu_reset_current()` restores the default image (used by `execve()`).
+
+**FPU/SSE context.** `cpu_init_security_features()` (BSP) and `cpu_init_ap_features()` (every AP) set `CR0.MP=1`, `CR0.EM=0`, `CR0.TS=0`, `CR0.NE=1`, `CR4.OSFXSR=1`, `CR4.OSXMMEXCPT=1`, execute `fninit` and load `MXCSR = 0x1F80`, and program a write-combining `IA32_PAT` entry (reusing one the bootloader already set, else entry 7) identically on every CPU. `fxsave_area` is `ALIGN_UP(fxsave_storage, 16)`, so `FXSAVE64`/`FXRSTOR64` cannot `#GP` even though `thread_t` comes from the 16-byte-granular heap; `thread_fpu_init()` checks the alignment and installs `FCW = 0x037F`, `MXCSR = 0x1F80`, zeroed `XMM0–15` for every thread, including static and per-CPU idle contexts. `switch_context(old, new, rsp0, cr3, old_fx, new_fx)` saves the outgoing image before the stack swap and restores the incoming one after the CR3 load. All FPU instructions live in `switch.asm` and `asm volatile` blocks; the C kernel stays `-mno-sse -mno-80387`.
+
+**QoS scheduling.** Each per-CPU ring dispatches the runnable thread with the highest `effective_qos` (`THREAD_QOS_INTERACTIVE > DEFAULT > BACKGROUND`), rotating within a class. Losing a decision to a higher class increments `qos_age`; at 8 (`DEFAULT`) or 16 (`BACKGROUND`) the thread runs one quantum regardless of class, so lower classes keep bounded forward progress. The running thread competes on the preemption tick, so it keeps the CPU against lower classes. `sched_handoff()` and `ipc_recv()` lend a `THREAD_BLOCKED_REPLY` caller's `effective_qos` to the server (`sched_qos_inherit()`); `ipc_reply()`, caller teardown (`ipc_thread_detach()`) and endpoint destruction restore the server's `base_qos` (`sched_qos_restore()`). The syscall ABI is in [`SYSCALL_ABI.md`](SYSCALL_ABI.md) §3.1.
 
 ### 4.4 `cap_t` & `cap_table_t` — Capability-Based Access Control
 Tasks hold opaque integer handles (`cap_t`) indexing into a private `cap_table_t` of 256 slots (`CAP_TABLE_SLOTS`). Slot 0 (`CAP_NULL`) never holds a capability. Each slot binds a kernel object pointer to an immutable rights bitmask and an optional **badge** (identifying the sender to a server).
@@ -234,10 +246,11 @@ typedef struct cap_slot {
     cap_obj_type_t type;
 } cap_slot_t;
 ```
+`cap_grant_rights()` copies a capability between two tables (requiring `CAP_RIGHT_GRANT`, rights `&`-attenuated); `SYS_CAP_GRANT` resolves the target table through the global task registry (`task_with_id()`), so isolated Ring 3 servers can hand each other endpoints, notifications, IRQs and frames. `CAP_OBJ_FRAME` has three kinds — `ANON` (one PMM frame, ownership moves on first map), `SHARED` (refcounted, mappable many times) and `DEVICE` (physical range outside the PMM, never freed, mapped `NX` with the software `PTE_DEVICE` bit and write-combining or uncached attributes). Boot capabilities (`cap_boot_register()`/`cap_boot_install()`) carry the Limine framebuffer and a read-only `display_info_t` page into PID 1 as handles 1 and 2 ([`SYSCALL_ABI.md`](SYSCALL_ABI.md) §4.1–4.2).
 
 ### 4.5 `endpoint_t` & `notification_t` — Inter-Process Communication
 1. **Synchronous Endpoints (`endpoint_t`):** rendezvous message passing (`ipc_call`, `ipc_recv`, `ipc_reply`). Transfers 4 x 64-bit message words directly through CPU registers without copying intermediate kernel buffers. Supports **badge minting**: when a server grants a derived endpoint capability with a custom `badge`, every incoming `ipc_call` delivers that `badge` to the receiver.
-2. **Asynchronous Notifications (`notification_t`):** an interrupt-safe 64-bit word (`uint64_t word`, protected by `irq_save`/`irq_restore`) supporting non-blocking bitwise-OR signaling (`notify_signal`) and blocking wait (`notify_wait`). External IRQs may be bound to a notification bit via `irq_bind_notification()`; a `cap_irq_object_t` owns the binding's lifetime.
+2. **Asynchronous Notifications (`notification_t`):** an interrupt-safe 64-bit word (`uint64_t word`, protected by `irq_save`/`irq_restore`) supporting non-blocking bitwise-OR signaling (`notify_signal`) and blocking wait (`notify_wait`). External IRQs may be bound to a notification bit via `irq_bind_notification()`; a `cap_irq_object_t` owns the binding's lifetime. A GSI-backed IRQ capability (`cap_irq_gsi_object_create()`) owns an IOAPIC line: delivery masks the GSI and signals the notification, `SYS_IRQ_ACK` unmasks it (§6.2).
 
 ---
 
@@ -258,6 +271,7 @@ To prevent deadlock, locks are always acquired top-down:
   - `heap_lock` (`kalloc.c`) is released before mapping new chunks so `vspace -> PMM` acquisition happens without the heap lock held.
   - `vspace_lock` (the global page-table lock) serializes all lower-half page-table/PTE mutation and keeps shootdown targets coherent.
   - `pmm_lock` is the innermost core lock.
+  - Stage E core locks: `task_registry_lock` (`task.c`) is taken before `cap_lock` (`cap.c`, guarding every capability table); `qos_lock` (`sched.c`) is a leaf; `irq_binding_lock` (`ipc.c`) is taken before `ioapic_lock`. Object releases always happen after `cap_lock` is dropped.
 
 Fine-grained per-process BSD state (`fd_table`, `mmap_regions`, `brk`, signal masks, `proc_table`) is serialized with `irq_save()`/`irq_restore()`.
 
@@ -294,6 +308,8 @@ Each AP:
 
 External interrupts are routed into **vectors `32..254`** (`IOAPIC_VECTOR_MIN..IOAPIC_VECTOR_MAX`). `ioapic_resolve_irq()` maps a legacy IRQ to its GSI through the MADT overrides; `ioapic_route_irq(gsi, vector, dest_lapic_id, active_low, level_triggered)` programs the redirection entry and unmasks it. The LAPIC timer uses its own vector and is never bound to the IOAPIC.
 
+**Capability-owned IRQs.** `ioapic_route_irq()` and `ioapic_bind_cap_irq()` record every routed GSI, so a capability can never claim a line a kernel driver (VirtIO-Blk) owns. `ioapic_bind_cap_irq(gsi, vector, dest, active_low, level)` programs the entry **masked**; `irq_cap_bind()` unmasks it once a notification is attached. On delivery `irq_forward_handler()` masks the GSI, `isr_dispatch()` sends the EOI, and the notification is signalled; `irq_cap_ack()` (`SYS_IRQ_ACK`) unmasks it; releasing the capability masks the line, clears the redirection entry and frees the vector (`0x50..0x6F`). `ioapic_irq_is_masked()` reports the mask bit for self-tests.
+
 ### 6.3 VirtIO-Blk DMA Driver (`src/io/virtio_blk.c`, `src/include/io/blkdev.h`)
 `blk_init()` finds the transitional `0x1AF4:0x1001` PCI function, resets it, negotiates one legacy split virtqueue, and allocates a physically contiguous virtqueue, a request-control page, and a DMA **bounce buffer** (`VIRTIO_BLK_MAX_SECTORS = 128` sectors). Transfers stage data through the bounce buffer, publish a three-descriptor chain (header, data, status), notify the device, and wait for completion from the device IRQ (with a bounded poll fallback). The device IRQ is routed through the IOAPIC to `VIRTIO_BLK_IRQ_VECTOR = 0x40`. The driver exposes a driver-agnostic `blkdev_t { capacity_sectors, read, write }` through `blkdev_primary()`; a timed-out or failed request latches `blk.failed` so timed-out descriptors are never reused.
 
@@ -306,8 +322,12 @@ External interrupts are routed into **vectors `32..254`** (`IOAPIC_VECTOR_MIN..I
 ├── etc/          motd, ...
 ├── dev/          virtual directory node
 │   └── console   COM1-backed character device (fd 0/1/2 for PID 1)
+├── proc/         virtual: meminfo, cpuinfo, self, <pid>/{status,maps}
+├── sys/          virtual: bus/pci/devices
 └── tmp/          writable scratch directory (ext2 builds)
 ```
+
+`/proc` and `/sys` are mounted by `vfs_mount_introspection()` right after `/dev` (`src/bsd/procfs.c`, see [`BSD_PERSONALITY.md`](BSD_PERSONALITY.md) §5.10); `/sys/bus/pci/devices` reads PCI data only through the read-only `pci_device_snapshot()` helper in `src/include/io/pci.h`.
 
 `ext2.c` implements direct (12), single-indirect, and double-indirect block mapping over `blkdev_t`, plus a triple-indirect constant reserved for future use. Block and inode allocation walk the group bitmaps and treat superblock/GDT/bitmap/inode-table blocks as reserved (`ext2_block_is_reserved`). An **open-entry table** keeps an inode alive after `unlink()` until the last live vnode reference is released (POSIX unlink-while-open semantics).
 

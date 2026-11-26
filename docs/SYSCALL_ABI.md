@@ -47,26 +47,103 @@ Bit `63` of `rax` cleanly partitions native **Microkernel Traps** from **Persona
 | `SYS_THREAD_EXIT` | `0x8000000000000001` | `(int64_t code)` | Terminate calling thread |
 | `SYS_THREAD_YIELD` | `0x8000000000000002` | `(void)` | Voluntarily yield current CPU timeslice |
 | `SYS_THREAD_SLEEP_MS` | `0x8000000000000003` | `(uint64_t ms)` | Sleep for the requested millisecond interval |
+| `SYS_THREAD_SET_QOS` | `0x8000000000000004` | `(uint64_t tid, uint64_t qos)` | Set a thread's base QoS class (`tid 0` = caller, else a thread of the calling task); `qos = SYS_QOS_QUERY` only reads. Base class in `rdx`, effective class in `r8` |
+| `SYS_TASK_ID` | `0x8000000000000005` | `(void)` | Caller's task id in `rdx` (the `SYS_CAP_GRANT` target selector), thread id in `r8` |
 | `SYS_IPC_CALL` | `0x8000000000000010` | `(cap_t ep, uint64_t m0, m1, m2, m3)` | Synchronous send + block for reply on endpoint |
 | `SYS_IPC_RECV` | `0x8000000000000011` | `(cap_t ep)` | Block until a message arrives; returns `msg[0..3]` and badge |
 | `SYS_IPC_REPLY` | `0x8000000000000012` | `(uint64_t m0, m1, m2, m3)` | Reply to the last caller received by the current thread |
+| `SYS_ENDPOINT_CREATE` | `0x8000000000000013` | `(void)` | Create an endpoint; new handle (`CAP_RIGHT_ALL`) in `rdx` |
 | `SYS_NOTIFY_SIGNAL` | `0x8000000000000020` | `(cap_t ntf, uint64_t mask)` | Atomically OR `mask` into the notification word |
 | `SYS_NOTIFY_WAIT` | `0x8000000000000021` | `(cap_t ntf)` | Wait for nonzero bits and atomically clear them; bits in `rdx` |
+| `SYS_NOTIFY_CREATE` | `0x8000000000000022` | `(void)` | Create a notification; new handle (`CAP_RIGHT_ALL`) in `rdx` |
 | `SYS_CAP_DERIVE` | `0x8000000000000030` | `(cap_t src, uint64_t rights, uint64_t badge)` | Derive an attenuated capability; new handle in `rdx` |
-| `SYS_CAP_GRANT` | `0x8000000000000031` | `(cap_t src)` | Duplicate within the calling task; new handle in `rdx` |
+| `SYS_CAP_GRANT` | `0x8000000000000031` | `(cap_t src, uint64_t target_task, uint64_t rights)` | Copy `src` (needs `CAP_RIGHT_GRANT`) into the target task's table with `rights & src.rights`; `target_task 0` = caller. Handle in the target's table in `rdx` |
 | `SYS_CAP_DELETE` | `0x8000000000000032` | `(cap_t cap)` | Remove a capability from the calling task's table |
 | `SYS_VSPACE_MAP` | `0x8000000000000040` | `(cap_t frame, uint64_t vaddr, uint64_t prot)` | Map a held frame capability into the task vspace |
 | `SYS_VSPACE_UNMAP` | `0x8000000000000041` | `(uint64_t vaddr, uint64_t size)` | Unmap a user virtual range |
+| `SYS_IRQ_BIND` | `0x8000000000000050` | `(cap_t irq, cap_t ntf, uint64_t bit)` | Attach a notification to a `CAP_OBJ_IRQ` (both need `CAP_RIGHT_WRITE`, `bit != 0`); unmasks a GSI-backed line |
+| `SYS_IRQ_ACK` | `0x8000000000000051` | `(cap_t irq)` | Re-arm (unmask) a GSI-backed IRQ after its driver serviced the device |
 | `SYS_DEBUG_LOG` | `0x80000000000000F0` | `(const char *buf, size_t len)` | Write a bounded user string (`<= 256` bytes) to the kernel console |
 
 IPC call/receive return the status in `rax`, the badge in `rdx`, and the four message
 words in `rsi`, `r8`, `r9`, and `r10`. `notify_wait` returns the observed bits in
-`rdx`. `SYS_CAP_DERIVE` and `SYS_CAP_GRANT` return the new capability handle in `rdx`.
-`SYS_CAP_GRANT` currently only duplicates a capability within the calling task (a
-task capability is not yet exposed by this ABI). `SYS_VSPACE_MAP` requires
+`rdx`. `SYS_CAP_DERIVE`, `SYS_CAP_GRANT`, `SYS_ENDPOINT_CREATE` and `SYS_NOTIFY_CREATE`
+return the new capability handle in `rdx`. `SYS_VSPACE_MAP` requires
 `CAP_RIGHT_READ` (plus `CAP_RIGHT_WRITE` when `prot` includes `VSPACE_PROT_WRITE`),
-rejects addresses below the null guard (`0x1000`) or unaligned to `PAGE_SIZE`, and
-transfers frame ownership to the vspace exactly once.
+rejects addresses below the null guard (`0x1000`) or unaligned to `PAGE_SIZE`, and maps
+every page the frame capability covers according to its kind (§4.1).
+
+### 3.1 `SYS_THREAD_SET_QOS` — Quality-of-Service Classes
+
+```c
+#define SYS_QOS_BACKGROUND  0ULL   /* THREAD_QOS_BACKGROUND:  bulk / maintenance work      */
+#define SYS_QOS_DEFAULT     1ULL   /* THREAD_QOS_DEFAULT:     every thread starts here     */
+#define SYS_QOS_INTERACTIVE 2ULL   /* THREAD_QOS_INTERACTIVE: compositor, HID, audio      */
+#define SYS_QOS_QUERY       0xFFFFFFFFFFFFFFFFULL /* read only, no change              */
+```
+
+- `rdi = tid`: `0` names the calling thread, otherwise a live thread of the **calling
+  task** (`SYS_ERR_INVAL` otherwise). `rsi = qos`: one of the classes above or
+  `SYS_QOS_QUERY`; any other value returns `SYS_ERR_INVAL`.
+- On success `rax = SYS_OK`, `rdx = base_qos`, `r8 = effective_qos`.
+- Every thread has a `base_qos` (what it asked for) and an `effective_qos =
+  max(base_qos, inherited)`. A thread created by duplicating its caller (BSD `fork()`)
+  inherits the creator's base class.
+- **Dispatch:** each per-CPU run queue always dispatches the runnable thread with the
+  highest `effective_qos`; equal classes rotate round-robin. **Aging:** each time a
+  runnable `DEFAULT`/`BACKGROUND` thread loses a dispatch decision to a higher class its
+  credit grows; at 8 (`DEFAULT`) or 16 (`BACKGROUND`) lost decisions it is dispatched
+  for one quantum regardless of class. A `BACKGROUND` thread therefore receives at least
+  one 2 ms quantum in every 17 dispatches even under saturating interactive load.
+- **Priority inheritance:** while a caller is blocked in `SYS_IPC_CALL`
+  (`THREAD_BLOCKED_REPLY`) on a server thread, the server's `effective_qos` is raised to
+  at least the caller's `effective_qos` (in `sched_handoff()` for the direct rendezvous
+  and in `ipc_recv()` when the server picks a queued caller). The boost ends — the server
+  falls back to its `base_qos` — when `SYS_IPC_REPLY` completes, or when the caller is
+  destroyed or woken by endpoint teardown.
+
+### 3.2 `SYS_CAP_GRANT` — Cross-Task Capability Transfer
+
+`SYS_CAP_GRANT(src, target_task, rights)` copies capability `src` of the calling task
+into the capability table of the task whose id is `target_task` (as reported by that
+task's `SYS_TASK_ID`; `0` or the caller's own id duplicates in place):
+
+- `src` must hold `CAP_RIGHT_GRANT` (`SYS_ERR_CAP_RIGHTS` otherwise).
+- The copy receives `rights & src.rights` — equal or attenuated, never amplified
+  (`rights` with bits outside `CAP_RIGHT_ALL` is `SYS_ERR_INVAL`). Granting without
+  `CAP_RIGHT_GRANT` produces a capability the receiver cannot pass on.
+- The badge and object are shared; the object gains one reference. Every capability
+  kind may be granted: `CAP_OBJ_ENDPOINT`, `CAP_OBJ_NOTIFICATION`, `CAP_OBJ_IRQ`,
+  `CAP_OBJ_FRAME` (and `CAP_OBJ_VSPACE`).
+- An unknown task id returns `SYS_ERR_INVAL`; a task that is being torn down returns
+  `SYS_ERR_DEAD`; a full target table returns `SYS_ERR_NOMEM`. On success `rdx` is the
+  handle **in the target's table**; the caller delivers it to the target out of band
+  (an IPC message or a pipe).
+
+The task registry and capability tables are serialised by spinlocks (`task registry ->
+cap`), so a grant is safe against concurrent use of either table from any CPU.
+
+### 3.3 `SYS_IRQ_BIND` / `SYS_IRQ_ACK` — User-Mode Interrupt Delivery
+
+A `CAP_OBJ_IRQ` backed by an IOAPIC GSI owns that line: the kernel allocates a vector
+(`0x50..0x6F`) and routes the GSI there **masked** (`ioapic_bind_cap_irq()`, which also
+refuses a GSI already routed by a kernel driver). `SYS_IRQ_BIND` attaches a notification
+bit and unmasks the line. When the interrupt fires the kernel masks the GSI, sends the
+LAPIC EOI and ORs the bit into the notification, waking `SYS_NOTIFY_WAIT`. The Ring 3
+driver services its device and calls `SYS_IRQ_ACK`, which unmasks the line; a
+level-triggered source therefore cannot storm the CPU while its driver works. Deleting
+the last capability masks the line and releases the GSI and vector. IRQ capabilities are
+minted by the kernel (boot capabilities) and passed on with `SYS_CAP_GRANT`.
+
+### 3.4 FPU / SSE State
+
+Every thread owns a 512-byte `FXSAVE64` image, 16-byte aligned inside `thread_t`. It
+starts as the clean default (`FCW = 0x037F`, `MXCSR = 0x1F80`, `XMM0-XMM15 = 0`, empty x87
+stack); `switch_context` executes `FXSAVE64` for the outgoing and `FXRSTOR64` for the
+incoming thread on every switch (eager switching, `CR0.TS` stays clear). Native threads
+created by duplication (BSD `fork()`) start with a copy of the creator's live registers;
+loading a new program image (BSD `execve()`) resets them to the default. The kernel
+itself is compiled with `-mno-sse -mno-80387` and never alters user FPU/SSE state.
 
 ---
 
@@ -97,6 +174,34 @@ typedef enum cap_obj_type {
 `cap_lookup_retained()` is used by blocking IPC so the capability table may be mutated
 while the caller sleeps; the caller releases the retained object with
 `mk_object_release()`.
+
+### 4.1 `CAP_OBJ_FRAME` Kinds
+
+| Kind | Backing | `SYS_VSPACE_MAP` | Release |
+| :--- | :--- | :--- | :--- |
+| `CAP_FRAME_ANON` | one PMM frame | once; ownership moves to the vspace | frame freed if never mapped |
+| `CAP_FRAME_SHARED` | one PMM frame, object holds a reference | any number of times; each mapping holds its own frame reference | object drops its reference; the frame lives until the last mapping goes |
+| `CAP_FRAME_DEVICE` | page-aligned physical range outside the PMM (MMIO, framebuffer) | any number of times; all pages of the range; always `NX`; write-combining (PAT) or uncached (`PCD`/`PWT`); `VSPACE_PROT_EXEC` is `SYS_ERR_INVAL` | **never** calls `pmm_free_frame()` |
+
+Device leaves carry the software `PTE_DEVICE` bit: unmapping or tearing down a vspace
+never returns them to the PMM, `vspace_clone()` shares them instead of copying,
+`mprotect` refuses to remap them, and `copy_from_user()`/`copy_to_user()` reject them.
+
+### 4.2 Boot Capabilities: Zero-Copy Framebuffer Handoff
+
+During boot the kernel captures the Limine linear framebuffer and registers two boot
+capabilities that `bsd_init()` installs into **PID 1** before its first instruction:
+
+| Handle | Object | Rights |
+| :--- | :--- | :--- |
+| `1` (`DISPLAY_BOOT_CAP_FRAMEBUFFER`) | `CAP_FRAME_DEVICE` over the whole framebuffer (page-rounded), write-combining | `READ | WRITE | GRANT` |
+| `2` (`DISPLAY_BOOT_CAP_INFO`) | `CAP_FRAME_SHARED` page holding a `display_info_t` | `READ | GRANT` (read-only) |
+
+`display_info_t` (`src/include/display.h`, 80 bytes) carries `magic` (`"LUCYDISP"`),
+`version`, `framebuffer_count`, `phys_base`, `size_bytes`, `mapped_bytes`, `width`,
+`height`, `pitch`, `bpp`, `memory_model`, the red/green/blue mask sizes and shifts, and
+`write_combining`. User space maps both frames and renders directly; the kernel contains
+no graphics code. A display server receives them from PID 1 via `SYS_CAP_GRANT`.
 
 ---
 

@@ -84,7 +84,7 @@ Numbers are from `src/include/bsd/syscall_bsd.h` / `user/bsd/bsd_user.h`; handle
 | `BSD_SYS_GETGID` | `47` | `uint32_t getgid(void)` | `proc.c` |
 | `BSD_SYS_SIGPROCMASK` | `48` | `int sigprocmask(int how, const uint64_t *set, uint64_t *oldset)` | `proc.c` (Stage B/C) |
 | `BSD_SYS_IOCTL` | `54` | `int ioctl(int fd, uint64_t req, void *arg)` | `syscall_bsd.c` / `console.c` |
-| `BSD_SYS_EXECVE` | `59` | `int execve(const char *path, char *const argv[], char *const envp[])` | `proc.c` |
+| `BSD_SYS_EXECVE` | `59` | `int execve(const char *path, char *const argv[], char *const envp[])` | `proc.c` (full `envp`, Stage E) |
 | `BSD_SYS_MUNMAP` | `73` | `int munmap(void *addr, size_t len)` | `mmap.c` |
 | `BSD_SYS_MPROTECT` | `74` | `int mprotect(void *addr, size_t len, int prot)` | `mmap.c` (Stage C) |
 | `BSD_SYS_SETPGID` | `82` | `int setpgid(int32_t pid, int32_t pgid)` | `proc.c` (Stage B) |
@@ -124,7 +124,21 @@ Valid only on the `/dev/console` vnode; any other vnode returns `BSD_ENOTTY`.
 | `BSD_TIOCSPGRP` | `0x5410` | in | Sets the console foreground process group from an `int32_t` |
 | `BSD_TIOCGPGRP` | `0x540F` | out | Reads the console foreground process group as an `int32_t` |
 
-### 3.3 `arch_prctl` Commands (`BSD_SYS_ARCH_PRCTL`)
+### 3.3 `execve` Argument & Environment Vectors (`BSD_SYS_EXECVE`)
+- `argv` and `envp` are NULL-terminated arrays of user pointers; either may be `NULL`
+  (an empty vector). An empty `argv` becomes `{ path }`.
+- At most `BSD_MAX_EXEC_ARGS` (`16`) entries per vector, each string shorter than
+  `BSD_PATH_MAX` (`256`), and at most `BSD_ARG_MAX` (`4096`) bytes of string data
+  (including NULs) across `argv` and `envp` together; otherwise `-BSD_E2BIG`.
+- Every pointer and string is read with `copy_from_user()`; a fault returns `-BSD_EFAULT`
+  and leaves the caller's image untouched.
+- The new image starts with `rsp` 16-byte aligned at `argc`, followed by `argv[]`, NULL,
+  `envp[]`, NULL (System V layout, see [`BSD_PERSONALITY.md`](BSD_PERSONALITY.md) §5.1),
+  plus `rdi = argc`, `rsi = argv`, `rdx = envp`, and a clean FPU/SSE state.
+- PID 1, which is not started by `execve`, is entered with `argc = 0` and
+  `argv = envp = NULL` in registers.
+
+### 3.4 `arch_prctl` Commands (`BSD_SYS_ARCH_PRCTL`)
 | Command | Value | Behavior |
 | :--- | :--- | :--- |
 | `BSD_ARCH_SET_FS` | `0x1002` | Sets the calling thread's TLS base and writes `IA32_FS_BASE` |
@@ -231,6 +245,17 @@ The user-stack `bsd_sigframe_t` layout is documented in
 [`BSD_PERSONALITY.md`](BSD_PERSONALITY.md) §5.
 
 ---
+
+### 5.5 Introspection Files (`/proc`, `/sys`)
+`/proc/meminfo`, `/proc/cpuinfo`, `/proc/self`, `/proc/<pid>/status`, `/proc/<pid>/maps`
+and `/sys/bus/pci/devices` are read with the ordinary `open`/`read`/`close`/`getdents`
+calls (`O_RDONLY`; they have no `write` operation). Their formats are documented in
+[`BSD_PERSONALITY.md`](BSD_PERSONALITY.md) §5.10. A `/proc/<pid>` for a pid that does not
+exist returns `-BSD_ENOENT`.
+
+BSD processes may also issue native microkernel syscalls (bit 63 set) such as
+`SYS_THREAD_SET_QOS`, `SYS_TASK_ID`, `SYS_CAP_GRANT` and `SYS_VSPACE_MAP`; those return
+`sys_status_t` codes, not errno values ([`SYSCALL_ABI.md`](SYSCALL_ABI.md)).
 
 ## 6. User Pointer Marshalling Rules
 

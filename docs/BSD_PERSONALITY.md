@@ -63,6 +63,7 @@ src/bsd/
 ├── bsd_init.c       # Registers mk_hooks_t, mounts root, spawns PID 1
 ├── proc.c           # Process lifecycle, PID/pgid, signals, fork/execve/wait4
 ├── vfs.c            # Path resolution, fd_table management, file ops, pipes
+├── procfs.c         # Virtual /proc and /sys introspection trees
 ├── ext2.c           # Writable ext2 filesystem driver (blocks, inodes, dirs)
 ├── initrd.c         # Read-only USTAR (tar) archive fallback root
 ├── console.c        # COM1-backed /dev/console character device
@@ -74,8 +75,10 @@ user/bsd/            # Freestanding BSD Ring 3 programs (/bin/init, /bin/sh, /bi
 
 `vfs_init()` mounts the writable `ext2` root at `/` when the VirtIO-Blk device is present.
 If no disk exists or the mount fails, `bsd_init()` falls back to the Limine `initrd.tar`
-module (read-only USTAR). `bsd_init()` then binds `/dev` and `/dev/console`, registers the
-hooks, and starts PID 1 (`/bin/init`).
+module (read-only USTAR). `bsd_init()` then binds `/dev` and `/dev/console`, mounts `/proc`
+and `/sys` (`vfs_mount_introspection()`), registers the hooks, and starts PID 1
+(`/bin/init`) with the kernel's boot capabilities (framebuffer and display-info frames,
+handles 1 and 2) already installed in its capability table.
 
 ---
 
@@ -154,14 +157,36 @@ IPC peers) is likewise only sound when both threads share one run queue.
 
 **`fork()`.** `bsd_proc_fork()` snapshots descriptors/cwd, `pgid`, `signal_mask`, signal
 actions, `brk`, mmap regions, uid/gid, and the parent thread's `fs_base` under `irq_save`,
-clones the address space with `vspace_clone()` (copy-on-write), and creates the child
-thread with `thread_create_with_fs_base()` so the inherited TLS base is visible before the
-child can be scheduled on any CPU. The child resumes via `user_frame_resume()` with
-`rax = 0`.
+clones the address space with `vspace_clone()` (copy-on-write; device mappings such as a
+mapped framebuffer are shared, not copied), and creates the child thread with
+`thread_create_inheriting()`, so the inherited TLS base, a copy of the parent's **live
+FPU/SSE register file** (`FXSAVE64` taken inside the `fork()` syscall) and the parent's
+base QoS class are all in place before the child can be scheduled on any CPU. The child
+starts with an empty capability table (the parent can hand it capabilities with
+`SYS_CAP_GRANT`) and resumes via `user_frame_resume()` with `rax = 0`.
 
-**`execve()`.** `bsd_proc_execve()` builds the new `vspace`, loads the ELF64 image, lays out
-`argv`/`envp` on the user stack, swaps the task vspace, then resets the data break and mmap
-regions. Signal handling is reset per POSIX: **custom handlers become `SIG_DFL`, while
+**`execve()`.** `bsd_proc_execve()` copies the path and the full `argv[]` and `envp[]`
+string arrays from the caller's address space (each at most `BSD_MAX_EXEC_ARGS = 16`
+strings of `< BSD_PATH_MAX` bytes, `BSD_ARG_MAX = 4096` bytes of string data in total
+across both; violations return `-BSD_E2BIG`, bad pointers `-BSD_EFAULT`), builds the new
+`vspace`, loads the ELF64 image, and lays out the System V initial stack:
+
+```text
+ELF_USER_STACK_TOP
+  argv strings, envp strings (NUL-terminated, packed downwards)
+  padding to 16 bytes
+  NULL                       <- end of envp[]
+  envp[envc-1] .. envp[0]
+  NULL                       <- end of argv[]
+  argv[argc-1] .. argv[0]
+  argc                       <- rsp at entry (16-byte aligned)
+```
+
+It also passes `rdi = argc`, `rsi = argv`, `rdx = envp` for freestanding entry points;
+musl's `_start` and the Rust runtime read the same values from the stack, so `environ`
+is populated. It then swaps the task vspace, resets the data break and mmap regions, and
+resets the thread's FPU/SSE state to the clean default (`FCW 0x037F`, `MXCSR 0x1F80`,
+`XMM0-15 = 0`). Signal handling is reset per POSIX: **custom handlers become `SIG_DFL`, while
 `SIG_IGN` dispositions and the blocked `signal_mask` are preserved**; `pending_signals` is
 cleared. The thread's TLS base is zeroed (`exec_thread->fs_base = 0` and `IA32_FS_BASE`
 MSR written to 0).
@@ -276,3 +301,24 @@ and `\n` are echoed as `\r\n`, and `Backspace` (`0x08`/`0x7F`) erases the previo
 It is opened as `fd 0` (stdin, read-only), `fd 1` (stdout) and `fd 2` (stderr) when PID 1
 is created. A blocking read returns `BSD_EINTR` when the process has a pending deliverable
 signal.
+
+### 5.10 Introspection Filesystems (`/proc`, `/sys`, `procfs.c`)
+`procfs.c` provides two read-only virtual trees, mounted beside `/dev`. Every file is a
+regular vnode (`0444`, size reported as 0 like Linux) whose text is regenerated on each
+`read()`; the requested offset window of that text is returned, so files can be read in
+any chunk size. Directories support `lookup` and `getdents`.
+
+| Path | Contents |
+| :--- | :--- |
+| `/proc/meminfo` | `MemTotal`/`MemFree`/`MemUsed` in kB and the raw `PmmTotalFrames`/`PmmFreeFrames`/`PmmUsedFrames` counters from the PMM |
+| `/proc/cpuinfo` | One block per online CPU: `processor`, `vendor_id` (CPUID leaf 0), `apicid`, `core id`, `cpu cores` (online count), `flags` |
+| `/proc/self` | Resolves to `/proc/<pid>` of the calling process |
+| `/proc/<pid>/status` | `Name`, `State`, `Pid`, `PPid`, `PGid`, `Uid`, `Gid`, `Threads`, `TaskId` (the `SYS_CAP_GRANT` target id), `QosBase`, `QosEffective`, `SigPnd`, `SigBlk`, `Brk` |
+| `/proc/<pid>/maps` | One line per coalesced run of live user mappings: `start-end rwxp 00000000 00:00 0 label`; `w` covers writable and copy-on-write pages, `s` marks device memory; labels are `[stack]`, `[heap]`, `[mmap]`, `[device]`, `[anon]` or the image name |
+| `/sys/bus/pci/devices` | One line per enumerated function: `bus:slot.func vendor:device class/subclass irq= pin= bar0=..bar5=` (`i` suffix = I/O port BAR) |
+
+`/proc/<pid>` uses `bsd_proc_snapshot()`, which copies process fields under the process
+table lock and, for `maps`, retains the address space (`vspace_ref()`) while
+`vspace_user_ranges()` walks it. `/sys/bus/pci/devices` reads PCI data only through
+`pci_device_snapshot()` (`src/include/io/pci.h`), a copy-out helper that never touches
+configuration space, keeping `src/io/` strictly below `src/bsd/`.
