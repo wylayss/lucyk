@@ -316,6 +316,22 @@ static void vspace_object_release(mk_object_t *object)
     kfree(wrapper);
 }
 
+static void hardware_object_release(mk_object_t *object)
+{
+    kfree(object);
+}
+
+/* Kernel-minted privileged hardware-control authority. */
+mk_object_t *cap_hardware_object_create(void)
+{
+    mk_object_t *object = (mk_object_t *)kalloc(sizeof(mk_object_t));
+    if (object == NULL) {
+        return NULL;
+    }
+    mk_object_init(object, CAP_OBJ_HARDWARE, hardware_object_release);
+    return object;
+}
+
 mk_object_t *cap_vspace_object_create(vspace_t *vspace)
 {
     if (vspace == NULL) {
@@ -355,6 +371,13 @@ static void frame_object_release(mk_object_t *object)
         break;
     case CAP_FRAME_DEVICE:
         /* Hardware memory: never returned to the PMM. */
+        break;
+    case CAP_FRAME_DMA:
+        /* Contiguous PMM run; drop the object's own reference on every page;
+         * live mappings hold additional per-page references. */
+        for (size_t page = 0; page < wrapper->page_count; page++) {
+            pmm_frame_unref(wrapper->phys + (paddr_t)page * PAGE_SIZE);
+        }
         break;
     }
     kfree(wrapper);
@@ -404,6 +427,20 @@ mk_object_t *cap_device_frame_object_create(paddr_t phys, size_t page_count,
     }
     return frame_object_alloc(phys, CAP_FRAME_DEVICE, page_count,
                               write_combining);
+}
+
+mk_object_t *cap_dma_frame_object_create(paddr_t phys, size_t page_count)
+{
+    if ((phys & PAGE_MASK) != 0 || page_count == 0 ||
+        page_count > (size_t)((UINT64_MAX - phys) / PAGE_SIZE)) {
+        return NULL;
+    }
+
+    /* The object takes over the caller's PMM reference on every page
+     * (pmm_alloc_contiguous()/pmm_alloc_frames() leave one each); it is
+     * dropped once in frame_object_release(). Mappings take additional
+     * per-page references. Never free a CAP_FRAME_DMA page directly. */
+    return frame_object_alloc(phys, CAP_FRAME_DMA, page_count, false);
 }
 
 static sys_status_t frame_map_anon(cap_frame_object_t *frame, vspace_t *vs,
@@ -481,6 +518,41 @@ static sys_status_t frame_map_device(cap_frame_object_t *frame, vspace_t *vs,
     return SYS_OK;
 }
 
+static sys_status_t frame_map_dma(cap_frame_object_t *frame, vspace_t *vs,
+                                  vaddr_t vaddr, uint64_t prot)
+{
+    if ((prot & VSPACE_PROT_EXEC) != 0) {
+        return SYS_ERR_INVAL;
+    }
+
+    /* Contiguous PMM pages; each mapped page takes its own reference so
+     * unmapping or tearing down the vspace never drops the last reference. */
+    for (size_t page = 0; page < frame->page_count; page++) {
+        vaddr_t va = vaddr + (vaddr_t)page * PAGE_SIZE;
+        paddr_t pa = frame->phys + (paddr_t)page * PAGE_SIZE;
+
+        if (pmm_frame_ref(pa) != SYS_OK) {
+            for (size_t undo = 0; undo < page; undo++) {
+                (void)vspace_unmap(vs, vaddr + (vaddr_t)undo * PAGE_SIZE);
+            }
+            return SYS_ERR_NOMEM;
+        }
+
+        sys_status_t status =
+            vspace_map_user(vs, va, pa, prot | VSPACE_PROT_USER |
+                                            VSPACE_PROT_OWNED);
+        if (status != SYS_OK) {
+            pmm_frame_unref(pa);
+            for (size_t undo = 0; undo < page; undo++) {
+                (void)vspace_unmap(vs, vaddr + (vaddr_t)undo * PAGE_SIZE);
+            }
+            return status;
+        }
+    }
+
+    return SYS_OK;
+}
+
 sys_status_t cap_frame_map(cap_frame_object_t *frame, vspace_t *vs,
                            vaddr_t vaddr, uint64_t prot)
 {
@@ -503,6 +575,8 @@ sys_status_t cap_frame_map(cap_frame_object_t *frame, vspace_t *vs,
         return frame_map_shared(frame, vs, vaddr, prot);
     case CAP_FRAME_DEVICE:
         return frame_map_device(frame, vs, vaddr, prot);
+    case CAP_FRAME_DMA:
+        return frame_map_dma(frame, vs, vaddr, prot);
     }
 
     return SYS_ERR_INVAL;

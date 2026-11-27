@@ -1,4 +1,5 @@
 #include <io.h>
+#include <io/fbcon.h>
 #include <klog.h>
 #include <spinlock.h>
 #include <types.h>
@@ -65,6 +66,9 @@ void serial_putc(char c)
         __asm__ volatile("pause");
     }
     outb(COM1_BASE + UART_REG_DATA, (uint8_t)c);
+
+    /* Mirror to the framebuffer text console (no-op once released / none). */
+    fbcon_putc(c);
 }
 
 void serial_write(const char *buf, size_t len)

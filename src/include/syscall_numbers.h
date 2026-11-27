@@ -33,4 +33,14 @@
 /* SYS_CAP_GRANT target selector naming the calling task itself. */
 #define SYS_CAP_GRANT_SELF  0ULL
 
+/* Stage F. */
+#define SYS_DMA_ALLOC        0x8000000000000060ULL /* (page_count, rights) -> CAP_FRAME_DMA */
+#define SYS_FRAME_PHYS_ADDR  0x8000000000000061ULL /* (frame_cap) -> phys (CAP_FRAME_DMA only) */
+#define SYS_PCI_CLAIM_BAR    0x8000000000000062ULL /* (bdf, bar_index) -> {cap, offset} */
+#define SYS_PCI_ALLOC_MSI    0x8000000000000063ULL /* (bdf, irq_cap) */
+#define SYS_FBCON_RELEASE    0x8000000000000064ULL /* (void) */
+
+/* SYS_DMA_ALLOC caps page_count at PMM_CONTIGUOUS_MAX_PAGES. */
+#define SYS_DMA_ALLOC_MAX_PAGES 256ULL
+
 #endif /* LUCYK_SYSCALL_NUMBERS_H */

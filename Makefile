@@ -66,7 +66,7 @@ C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(C_SRCS))
 ASM_OBJS := $(patsubst src/%.asm,$(OBJ_DIR)/%.asm.o,$(ASM_SRCS))
 OBJS     := $(C_OBJS) $(ASM_OBJS)
 
-.PHONY: all clean run run-uefi run-smp1 run-smp4 verify limine
+.PHONY: all clean run run-uefi run-smp1 run-smp4 run-ahci verify limine
 
 all: $(ISO) $(DISK)
 
@@ -217,6 +217,12 @@ run-smp4: $(ISO) $(DISK)
 		-no-reboot -no-shutdown \
 		-drive file=$(DISK),if=none,id=hd0,format=raw \
 		-device virtio-blk-pci,drive=hd0
+
+run-ahci: $(ISO) $(DISK)
+	$(QEMU) -M q35 -m 512M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown \
+		-drive id=disk0,file=$(DISK),format=raw,if=none \
+		-device ahci,id=ahci \
+		-device ide-hd,drive=disk0,bus=ahci.0
 
 run-uefi: $(ISO) $(DISK)
 	$(QEMU) -M q35 -m 512M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown \

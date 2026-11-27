@@ -350,3 +350,22 @@ void pmm_free_frames(uint64_t phys, size_t count)
 
     spin_unlock_irqrestore(&pmm_lock, flags);
 }
+
+uint64_t pmm_alloc_contiguous(size_t page_count)
+{
+    if (page_count == 0 || page_count > PMM_CONTIGUOUS_MAX_PAGES) {
+        return 0;
+    }
+
+    return pmm_alloc_frames(page_count);
+}
+
+void pmm_free_contiguous(uintptr_t phys, size_t page_count)
+{
+    if (page_count == 0 || page_count > PMM_CONTIGUOUS_MAX_PAGES ||
+        (phys & (uintptr_t)(PAGE_SIZE - 1U)) != 0) {
+        return;
+    }
+
+    pmm_free_frames((uint64_t)phys, page_count);
+}

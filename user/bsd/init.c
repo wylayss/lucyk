@@ -2179,6 +2179,52 @@ __attribute__((noreturn)) static void envtest_main(int argc, char **argv,
     user_exit(0);
 }
 
+#define SYS_VSPACE_PROT_WRITE 0x1ULL
+
+/* Stage F: contiguous DMA + physical address lookup. */
+static void run_stage_f_tests(void)
+{
+    /* --- SYS_DMA_ALLOC + SYS_FRAME_PHYS_ADDR + SYS_VSPACE_MAP --- */
+    native_result_t dma = native_call(SYS_DMA_ALLOC, 2ULL, SYS_CAP_RIGHT_ALL,
+                                      0, 0, 0);
+    if (dma.status != 0 || dma.rdx == 0) {
+        fail(600);
+    }
+    uint64_t cap = dma.rdx;
+
+    /* Contiguous pages must be page-aligned physical + reject EXEC map. */
+    native_result_t phys = native_call(SYS_FRAME_PHYS_ADDR, cap, 0, 0, 0, 0);
+    if (phys.status != 0 || (phys.rdx & 0xFFFULL) != 0) {
+        fail(601);
+    }
+
+    uint64_t va = 0x008000000000ULL; /* scratch user VA */
+    native_result_t mapw = native_call(SYS_VSPACE_MAP, cap, va,
+                                       SYS_VSPACE_PROT_WRITE, 0, 0);
+    if (mapw.status != 0) {
+        fail(602);
+    }
+    /* PTE_EXEC never allowed on DMA. */
+    native_result_t mapx = native_call(SYS_VSPACE_MAP, cap, va + 0x2000ULL,
+                                       0x2ULL, 0, 0);
+    if (mapx.status == 0) {
+        fail(603);
+    }
+
+    /* Non-DMA frames rejected by SYS_FRAME_PHYS_ADDR. */
+    native_result_t bad = native_call(SYS_FRAME_PHYS_ADDR, DISPLAY_BOOT_CAP_INFO,
+                                      0, 0, 0, 0);
+    if (bad.status == 0) {
+        fail(604);
+    }
+
+    (void)native_call(SYS_VSPACE_UNMAP, va, 0x2000ULL, 0, 0, 0);
+    (void)native_call(SYS_CAP_DELETE, cap, 0, 0, 0, 0);
+
+    write_text(1, "init: Stage F SYS_DMA_ALLOC contiguous + "
+                   "SYS_FRAME_PHYS_ADDR (DMA-only) verified\n");
+}
+
 static void run_stage_e_tests(void)
 {
     write_text(1, "init: Stage E tests\n");
@@ -2301,6 +2347,7 @@ void user_main(int argc, char **argv, char **envp)
     }
 
     run_stage_e_tests();
+    run_stage_f_tests();
 
     print_motd();
     spawn_shell();

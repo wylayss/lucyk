@@ -4,6 +4,8 @@
 #include <spinlock.h>
 #include <string.h>
 #include <types.h>
+#include <pmm.h>
+#include <vspace.h>
 
 #define PCI_CONFIG_ADDRESS 0xCF8U
 #define PCI_CONFIG_DATA    0xCFCU
@@ -169,6 +171,8 @@ static void decode_bar(pci_device_t *dev, size_t index)
         dev->bar_io[index + 1U] = false;
         dev->bar[index + 1U] = 0;
         dev->bar_size[index + 1U] = 0;
+        dev->bar64[index] = true;
+        dev->bar64[index + 1U] = true; /* reserved second half of a 64-bit BAR */
         return;
     }
 
@@ -234,6 +238,8 @@ static void add_function(uint8_t bus, uint8_t slot, uint8_t func)
         pci_cfg_read8(bus, slot, func, PCI_REG_CLASS);
     dev->subclass =
         pci_cfg_read8(bus, slot, func, PCI_REG_SUBCLASS);
+    dev->prog_if =
+        pci_cfg_read8(bus, slot, func, 0x09U);
     dev->header_type =
         pci_cfg_read8(bus, slot, func, PCI_REG_HEADER_TYPE);
     dev->interrupt_line =
@@ -335,6 +341,75 @@ const pci_device_t *pci_device_at(size_t index)
 
     return &pci_devices[index];
 }
+/* Claim tracking for SYS_PCI_CLAIM_BAR: a function+BAR can be claimed once. */
+#define PCI_CLAIMED_MAX (PCI_MAX_DEVICES * PCI_BAR_COUNT)
+static bool pci_bar_claimed[PCI_CLAIMED_MAX];
+static bool pci_kernel_claimed[PCI_MAX_DEVICES];
+
+sys_status_t pci_claim_bar(uint8_t bus, uint8_t slot, uint8_t func,
+                           uint32_t bar_index)
+{
+    if (bar_index >= PCI_BAR_COUNT) {
+        return SYS_ERR_INVAL;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&pci_cfg_lock);
+
+    /* Find the enumerated function index. */
+    size_t index = pci_count;
+    for (size_t i = 0; i < pci_count; i++) {
+        if (pci_devices[i].bus == bus && pci_devices[i].slot == slot &&
+            pci_devices[i].func == func) {
+            index = i;
+            break;
+        }
+    }
+
+    if (index >= pci_count) {
+        spin_unlock_irqrestore(&pci_cfg_lock, flags);
+        return SYS_ERR_INVAL;
+    }
+
+    /* A kernel driver already owns this function. */
+    if (pci_kernel_claimed[index]) {
+        spin_unlock_irqrestore(&pci_cfg_lock, flags);
+        return SYS_ERR_BUSY;
+    }
+
+    size_t key = index * PCI_BAR_COUNT + bar_index;
+    if (key >= PCI_CLAIMED_MAX || pci_bar_claimed[key]) {
+        spin_unlock_irqrestore(&pci_cfg_lock, flags);
+        return SYS_ERR_BUSY;
+    }
+
+    pci_bar_claimed[key] = true;
+    spin_unlock_irqrestore(&pci_cfg_lock, flags);
+    return SYS_OK;
+}
+
+void pci_release_bar(uint8_t bus, uint8_t slot, uint8_t func,
+                     uint32_t bar_index)
+{
+    if (bar_index >= PCI_BAR_COUNT) {
+        return;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&pci_cfg_lock);
+
+    for (size_t i = 0; i < pci_count; i++) {
+        if (pci_devices[i].bus == bus && pci_devices[i].slot == slot &&
+            pci_devices[i].func == func) {
+            size_t key = i * PCI_BAR_COUNT + bar_index;
+            if (key < PCI_CLAIMED_MAX) {
+                pci_bar_claimed[key] = false;
+            }
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&pci_cfg_lock, flags);
+}
+
 bool pci_device_snapshot(size_t index, pci_device_t *out)
 {
     if (out == NULL || index >= pci_count) {
@@ -343,4 +418,171 @@ bool pci_device_snapshot(size_t index, pci_device_t *out)
 
     memcpy(out, &pci_devices[index], sizeof(*out));
     return true;
+}
+
+
+#define PCI_REG_STATUS 0x06U
+#define PCI_REG_CAP_PTR 0x34U
+#define PCI_STATUS_CAP_LIST 0x10U
+#define PCI_CAP_MSI 0x05U
+#define PCI_CAP_MSIX 0x11U
+
+/* Programs PCI MSI (preferred) or MSI-X for one function. vector is a LAPIC
+ * vector; apic_id is the destination LAPIC. Returns SYS_OK on success. */
+sys_status_t pci_msi_configure(uint8_t bus, uint8_t slot, uint8_t func,
+                               uint8_t vector, uint32_t apic_id)
+{
+    uint16_t status = pci_cfg_read16(bus, slot, func, PCI_REG_STATUS);
+    if ((status & PCI_STATUS_CAP_LIST) == 0) {
+        return SYS_ERR_NOSYS;
+    }
+
+    uint8_t cap = pci_cfg_read8(bus, slot, func, PCI_REG_CAP_PTR);
+    bool saw_msi = false;
+    bool saw_msix = false;
+    uint8_t msi_off = 0;
+    uint8_t msix_off = 0;
+
+    for (int guard = 0; cap != 0 && guard < 32; guard++) {
+        uint8_t id = pci_cfg_read8(bus, slot, func, cap);
+        uint8_t next = pci_cfg_read8(bus, slot, func, (uint8_t)(cap + 1U));
+        if (id == PCI_CAP_MSI) { saw_msi = true; msi_off = cap; }
+        if (id == PCI_CAP_MSIX) { saw_msix = true; msix_off = cap; }
+        cap = next;
+    }
+
+    uint32_t msg_addr = 0xFEE00000U | ((apic_id & 0xFFU) << 12);
+
+    if (saw_msi) {
+        uint8_t off = msi_off;
+        uint16_t ctrl = pci_cfg_read16(bus, slot, func, (uint8_t)(off + 2U));
+        bool is64 = (ctrl & 0x80U) != 0;
+        /* one message */
+        ctrl = (uint16_t)((ctrl & ~0x70U) | 0x0U);
+        pci_cfg_write32(bus, slot, func, (uint8_t)(off + 4U), msg_addr);
+        if (is64) {
+            pci_cfg_write32(bus, slot, func, (uint8_t)(off + 8U), 0U);
+            pci_cfg_write16(bus, slot, func, (uint8_t)(off + 12U), vector);
+        } else {
+            pci_cfg_write16(bus, slot, func, (uint8_t)(off + 8U), vector);
+        }
+        ctrl |= 0x01U; /* MSI enable */
+        pci_cfg_write16(bus, slot, func, (uint8_t)(off + 2U), ctrl);
+        return SYS_OK;
+    }
+
+    if (saw_msix) {
+        uint8_t off = msix_off;
+        uint16_t ctrl = pci_cfg_read16(bus, slot, func, (uint8_t)(off + 2U));
+        uint32_t table = pci_cfg_read32(bus, slot, func, (uint8_t)(off + 4U));
+        uint32_t table_bir = table & 0x7U;
+        uint32_t table_off = table & ~0x7U;
+
+        if (table_bir >= PCI_BAR_COUNT) {
+            return SYS_ERR_INVAL;
+        }
+
+        /* Need a PCI function to find BAR; caller validated bdf. */
+        uint64_t bar = 0;
+        for (size_t i = 0; i < pci_count; i++) {
+            if (pci_devices[i].bus == bus && pci_devices[i].slot == slot &&
+                pci_devices[i].func == func) {
+                bar = pci_devices[i].bar[table_bir];
+                break;
+            }
+        }
+        if (bar == 0) {
+            return SYS_ERR_INVAL;
+        }
+
+        /* MSI-X table is device MMIO: access it through an uncached,
+         * non-executable kernel mapping (PTE_DEVICE|PTE_NX), not cacheable
+         * HHDM, to avoid stale writes/faults on bare metal. */
+        uint64_t table_phys = (bar & ~0xFFFULL) + (uint64_t)table_off;
+        uint64_t page_phys = table_phys & ~0xFFFULL;
+        uint64_t page_off = table_phys & 0xFFFULL;
+        vaddr_t msix_va = 0xFFFF900000300000ULL;
+
+        uint64_t msix_flags = VSPACE_PROT_WRITE | VSPACE_PROT_DEVICE |
+                              VSPACE_PROT_PCD | VSPACE_PROT_PWT;
+        if (vspace_map_kernel(msix_va, page_phys, msix_flags) != SYS_OK) {
+            return SYS_ERR_NOMEM;
+        }
+
+        volatile uint32_t *entry =
+            (volatile uint32_t *)(uintptr_t)(msix_va + page_off);
+        entry[0] = msg_addr;
+        entry[1] = 0U;
+        entry[2] = vector;
+        entry[3] = 0U; /* unmasked */
+
+        ctrl |= 0x8000U; /* MSI-X enable */
+        ctrl &= ~0x4000U; /* clear function mask */
+        pci_cfg_write16(bus, slot, func, (uint8_t)(off + 2U), ctrl);
+        return SYS_OK;
+    }
+
+    return SYS_ERR_NOSYS;
+}
+
+
+/* Marks an entire PCI function as owned by a Ring 0 driver (AHCI, VirtIO-Blk,
+ * ...). SYS_PCI_CLAIM_BAR / SYS_PCI_ALLOC_MSI refuse kernel-owned devices. */
+sys_status_t pci_kernel_claim(uint8_t bus, uint8_t slot, uint8_t func)
+{
+    uint64_t flags = spin_lock_irqsave(&pci_cfg_lock);
+
+    for (size_t i = 0; i < pci_count; i++) {
+        if (pci_devices[i].bus == bus && pci_devices[i].slot == slot &&
+            pci_devices[i].func == func) {
+            pci_kernel_claimed[i] = true;
+            spin_unlock_irqrestore(&pci_cfg_lock, flags);
+            return SYS_OK;
+        }
+    }
+
+    spin_unlock_irqrestore(&pci_cfg_lock, flags);
+    return SYS_ERR_INVAL;
+}
+
+bool pci_is_kernel_claimed(uint8_t bus, uint8_t slot, uint8_t func)
+{
+    bool claimed = false;
+    uint64_t flags = spin_lock_irqsave(&pci_cfg_lock);
+
+    for (size_t i = 0; i < pci_count; i++) {
+        if (pci_devices[i].bus == bus && pci_devices[i].slot == slot &&
+            pci_devices[i].func == func) {
+            claimed = pci_kernel_claimed[i];
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&pci_cfg_lock, flags);
+    return claimed;
+}
+
+
+/* Clears MSI/MSI-X enable for one function. */
+void pci_msi_disable(uint8_t bus, uint8_t slot, uint8_t func)
+{
+    uint16_t status = pci_cfg_read16(bus, slot, func, PCI_REG_STATUS);
+    if ((status & PCI_STATUS_CAP_LIST) == 0) {
+        return;
+    }
+
+    uint8_t cap = pci_cfg_read8(bus, slot, func, PCI_REG_CAP_PTR);
+    for (int guard = 0; cap != 0 && guard < 32; guard++) {
+        uint8_t id = pci_cfg_read8(bus, slot, func, cap);
+        uint8_t next = pci_cfg_read8(bus, slot, func, (uint8_t)(cap + 1U));
+        uint16_t ctrl = pci_cfg_read16(bus, slot, func, (uint8_t)(cap + 2U));
+        if (id == PCI_CAP_MSI) {
+            pci_cfg_write16(bus, slot, func, (uint8_t)(cap + 2U),
+                            (uint16_t)(ctrl & ~0x01U));
+        } else if (id == PCI_CAP_MSIX) {
+            pci_cfg_write16(bus, slot, func, (uint8_t)(cap + 2U),
+                            (uint16_t)(ctrl & ~0x8000U));
+        }
+        cap = next;
+    }
 }
