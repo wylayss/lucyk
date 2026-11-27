@@ -13,8 +13,8 @@
 void user_main(void);
 __attribute__((noreturn)) void user_exit(uint64_t code);
 
-static const char phase5_hello[] = "phase5: Ring 3 syscall path online";
-static const char phase5_done[] = "phase5: init_test complete";
+static const char exec_hello[] = "exec: Ring 3 syscall path online";
+static const char exec_done[] = "exec: init_test complete";
 
 static int is_complement(uint64_t value, uint64_t original)
 {
@@ -54,8 +54,8 @@ void user_main(void)
     }
 
     status = user_syscall(SYS_DEBUG_LOG,
-                          (uint64_t)(uintptr_t)phase5_hello,
-                          sizeof(phase5_hello) - 1, 0, 0, 0);
+                          (uint64_t)(uintptr_t)exec_hello,
+                          sizeof(exec_hello) - 1, 0, 0, 0);
     if (status != 0) {
         user_exit(1);
     }
@@ -93,7 +93,7 @@ void user_main(void)
         user_exit(6);
     }
 
-    (void)user_syscall(SYS_DEBUG_LOG, (uint64_t)(uintptr_t)phase5_done,
-                       sizeof(phase5_done) - 1, 0, 0, 0);
+    (void)user_syscall(SYS_DEBUG_LOG, (uint64_t)(uintptr_t)exec_done,
+                       sizeof(exec_done) - 1, 0, 0, 0);
     user_exit(0);
 }

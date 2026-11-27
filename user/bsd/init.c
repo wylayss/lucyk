@@ -3,7 +3,7 @@
 #include <display.h>
 #include <syscall_numbers.h>
 
-/* Native ABI values used by the Stage E tests (docs/SYSCALL_ABI.md). */
+/* Native ABI values used by the tests (docs/SYSCALL_ABI.md). */
 #define SYS_ERR_INVAL_USER      (-1)
 #define SYS_ERR_CAP_INVALID_USER (-3)
 #define SYS_ERR_CAP_RIGHTS_USER (-4)
@@ -37,7 +37,7 @@ __attribute__((noreturn)) static void fail(int32_t code)
 
 /* Probes whether `/` is writable by creating and removing a scratch file.
  * Returns nonzero on a writable ext2 root, zero on a read-only initrd
- * fallback. Used to skip Stage D2 ext2 tests cleanly on read-only roots
+ * fallback. Used to skip ext2 tests cleanly on read-only roots
  * while still enforcing them strictly whenever ext2 is mounted. */
 static int root_writable(void)
 {
@@ -168,7 +168,7 @@ static void test_exec_echo(void)
         char *argv[3];
 
         argv[0] = "echo";
-        argv[1] = "phase3-exec-ok";
+        argv[1] = "exec-ok";
         argv[2] = NULL;
 
         (void)bsd_execve("/bin/echo", argv, NULL);
@@ -517,7 +517,7 @@ static void test_fork_storm(void)
 }
 
 /* ====================================================================== */
-/* Kernel Stage C Tests                                                    */
+/* Signal, TLS and memory-protection tests                                  */
 /* ====================================================================== */
 
 /* Signal handler trampoline: invokes sigreturn with the frame pointer. */
@@ -1375,17 +1375,17 @@ static void test_ext2_concurrent(void)
 
 
 /* ------------------------------------------------------------------------- */
-/* Kernel Stage E: FPU/SSE, QoS + priority inheritance, capability handoff,   */
-/* /proc and /sys, execve envp                                                */
+/* Platform: FPU/SSE, QoS + priority inheritance, capability handoff,        */
+/* /proc and /sys, execve envp                                               */
 /* ------------------------------------------------------------------------- */
 
 #define SSE_ITERATIONS 250000ULL
 #define SSE_ROUNDS     4U
 #define SSE_CHILDREN   3
 
-#define STAGE_E_INFO_VA 0x0000007300000000ULL
-#define STAGE_E_FB_VA   0x0000007400000000ULL
-#define STAGE_E_PROT_WRITE 1ULL
+#define SELFTEST_INFO_VA 0x0000007300000000ULL
+#define SELFTEST_FB_VA   0x0000007400000000ULL
+#define SELFTEST_PROT_WRITE 1ULL
 
 typedef struct native_result {
     int64_t  status;
@@ -1612,7 +1612,7 @@ static void sse_load_all(const uint64_t image[32])
         : "memory");
 }
 
-static char stage_e_buf[8192];
+static char selftest_buf[8192];
 
 static uint64_t sse_image_a[32] __attribute__((aligned(16)));
 static uint64_t sse_image_b[32] __attribute__((aligned(16)));
@@ -1761,19 +1761,19 @@ static void echo_line(const char *prefix, const char *text, const char *key)
 static void test_framebuffer_caps(void)
 {
     native_result_t r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_INFO,
-                                    STAGE_E_INFO_VA, STAGE_E_PROT_WRITE, 0, 0);
+                                    SELFTEST_INFO_VA, SELFTEST_PROT_WRITE, 0, 0);
     if (r.status != SYS_ERR_CAP_RIGHTS_USER) {
         fail(510);
     }
 
-    r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_INFO, STAGE_E_INFO_VA, 0,
+    r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_INFO, SELFTEST_INFO_VA, 0,
                     0, 0);
     if (r.status != 0) {
         fail(511);
     }
 
     const volatile display_info_t *info =
-        (const volatile display_info_t *)(uintptr_t)STAGE_E_INFO_VA;
+        (const volatile display_info_t *)(uintptr_t)SELFTEST_INFO_VA;
 
     if (info->magic != DISPLAY_INFO_MAGIC ||
         info->version != DISPLAY_INFO_VERSION || info->width == 0 ||
@@ -1790,16 +1790,16 @@ static void test_framebuffer_caps(void)
     uint64_t mapped = info->mapped_bytes;
 
     r = native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_FRAMEBUFFER,
-                    STAGE_E_FB_VA, STAGE_E_PROT_WRITE, 0, 0);
+                    SELFTEST_FB_VA, SELFTEST_PROT_WRITE, 0, 0);
     if (r.status != 0) {
         fail(513);
     }
 
     /* Zero copy: Ring 3 writes land directly in the device framebuffer. */
     if (bpp == 32) {
-        volatile uint32_t *row = (volatile uint32_t *)(uintptr_t)STAGE_E_FB_VA;
+        volatile uint32_t *row = (volatile uint32_t *)(uintptr_t)SELFTEST_FB_VA;
         volatile uint32_t *last =
-            (volatile uint32_t *)(uintptr_t)(STAGE_E_FB_VA +
+            (volatile uint32_t *)(uintptr_t)(SELFTEST_FB_VA +
                                              (height - 1U) * pitch);
 
         for (uint32_t x = 0; x < 64U; x++) {
@@ -1813,15 +1813,15 @@ static void test_framebuffer_caps(void)
         }
     }
 
-    if (read_whole("/proc/self/maps", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
-        find_text(stage_e_buf, "rw-s 00000000 00:00 0 [device]") == NULL ||
-        find_text(stage_e_buf, "r--p") == NULL) {
+    if (read_whole("/proc/self/maps", selftest_buf, sizeof(selftest_buf)) <= 0 ||
+        find_text(selftest_buf, "rw-s 00000000 00:00 0 [device]") == NULL ||
+        find_text(selftest_buf, "r--p") == NULL) {
         fail(515);
     }
 
-    if (native_call(SYS_VSPACE_UNMAP, STAGE_E_FB_VA, mapped, 0, 0, 0).status !=
+    if (native_call(SYS_VSPACE_UNMAP, SELFTEST_FB_VA, mapped, 0, 0, 0).status !=
             0 ||
-        native_call(SYS_VSPACE_UNMAP, STAGE_E_INFO_VA, PAGE_BYTES, 0, 0, 0)
+        native_call(SYS_VSPACE_UNMAP, SELFTEST_INFO_VA, PAGE_BYTES, 0, 0, 0)
                 .status != 0) {
         fail(516);
     }
@@ -1900,18 +1900,18 @@ static void test_qos_ipc_grant(void)
 
         /* The granted display-info frame is READ-only and cannot be
          * re-granted (no CAP_RIGHT_GRANT). */
-        if (native_call(SYS_VSPACE_MAP, handles[1], STAGE_E_INFO_VA,
-                        STAGE_E_PROT_WRITE, 0, 0).status !=
+        if (native_call(SYS_VSPACE_MAP, handles[1], SELFTEST_INFO_VA,
+                        SELFTEST_PROT_WRITE, 0, 0).status !=
                 SYS_ERR_CAP_RIGHTS_USER ||
             native_call(SYS_CAP_GRANT, handles[1], SYS_CAP_GRANT_SELF,
                         SYS_CAP_RIGHT_READ, 0, 0).status !=
                 SYS_ERR_CAP_RIGHTS_USER ||
-            native_call(SYS_VSPACE_MAP, handles[1], STAGE_E_INFO_VA, 0, 0, 0)
+            native_call(SYS_VSPACE_MAP, handles[1], SELFTEST_INFO_VA, 0, 0, 0)
                     .status != 0) {
             user_exit(63);
         }
         const volatile display_info_t *info =
-            (const volatile display_info_t *)(uintptr_t)STAGE_E_INFO_VA;
+            (const volatile display_info_t *)(uintptr_t)SELFTEST_INFO_VA;
         if (info->magic != DISPLAY_INFO_MAGIC || info->width == 0) {
             user_exit(64);
         }
@@ -2011,20 +2011,20 @@ static void test_qos_ipc_grant(void)
 /* E3: /proc and /sys from Ring 3. */
 static void test_proc_sys(void)
 {
-    if (read_whole("/proc/meminfo", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
-        find_text(stage_e_buf, "MemTotal:") == NULL ||
-        find_text(stage_e_buf, "PmmFreeFrames:") == NULL) {
+    if (read_whole("/proc/meminfo", selftest_buf, sizeof(selftest_buf)) <= 0 ||
+        find_text(selftest_buf, "MemTotal:") == NULL ||
+        find_text(selftest_buf, "PmmFreeFrames:") == NULL) {
         fail(540);
     }
-    echo_line("init: /proc/meminfo ", stage_e_buf, "MemFree:");
+    echo_line("init: /proc/meminfo ", selftest_buf, "MemFree:");
 
-    if (read_whole("/proc/cpuinfo", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
-        find_text(stage_e_buf, "vendor_id") == NULL) {
+    if (read_whole("/proc/cpuinfo", selftest_buf, sizeof(selftest_buf)) <= 0 ||
+        find_text(selftest_buf, "vendor_id") == NULL) {
         fail(541);
     }
 
-    size_t processors = count_text(stage_e_buf, "processor\t: ");
-    const char *cores = find_text(stage_e_buf, "cpu cores\t: ");
+    size_t processors = count_text(selftest_buf, "processor\t: ");
+    const char *cores = find_text(selftest_buf, "cpu cores\t: ");
     int64_t reported = 0;
 
     if (cores != NULL) {
@@ -2046,18 +2046,18 @@ static void test_proc_sys(void)
     write_unsigned(1, processors);
     write_text(1, " online CPU(s)\n");
 
-    if (read_whole("/proc/self/maps", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
-        find_text(stage_e_buf, "r-xp") == NULL ||
-        find_text(stage_e_buf, "rw-p 00000000 00:00 0 [stack]") == NULL) {
+    if (read_whole("/proc/self/maps", selftest_buf, sizeof(selftest_buf)) <= 0 ||
+        find_text(selftest_buf, "r-xp") == NULL ||
+        find_text(selftest_buf, "rw-p 00000000 00:00 0 [stack]") == NULL) {
         fail(543);
     }
 
-    if (read_whole("/proc/self/status", stage_e_buf, sizeof(stage_e_buf)) <=
+    if (read_whole("/proc/self/status", selftest_buf, sizeof(selftest_buf)) <=
             0 ||
-        find_text(stage_e_buf, "Pid:\t1\n") == NULL ||
-        find_text(stage_e_buf, "Name:\tinit") == NULL ||
-        read_whole("/proc/1/status", stage_e_buf, sizeof(stage_e_buf)) <= 0 ||
-        find_text(stage_e_buf, "PPid:\t0\n") == NULL ||
+        find_text(selftest_buf, "Pid:\t1\n") == NULL ||
+        find_text(selftest_buf, "Name:\tinit") == NULL ||
+        read_whole("/proc/1/status", selftest_buf, sizeof(selftest_buf)) <= 0 ||
+        find_text(selftest_buf, "PPid:\t0\n") == NULL ||
         bsd_open("/proc/4242/status", BSD_O_RDONLY, 0) != -BSD_ENOENT) {
         fail(544);
     }
@@ -2086,11 +2086,11 @@ static void test_proc_sys(void)
         fail(546);
     }
 
-    if (read_whole("/sys/bus/pci/devices", stage_e_buf, sizeof(stage_e_buf)) <=
+    if (read_whole("/sys/bus/pci/devices", selftest_buf, sizeof(selftest_buf)) <=
             0) {
         fail(547);
     }
-    echo_line("init: /sys/bus/pci/devices ", stage_e_buf, "00:03.0");
+    echo_line("init: /sys/bus/pci/devices ", selftest_buf, "00:03.0");
 
     write_text(1,
                "init: /proc/meminfo, /proc/cpuinfo, /proc/self/{maps,status}, "
@@ -2122,7 +2122,7 @@ static void test_exec_envp(void)
     }
     if (pid == 0) {
         char *argv[3] = { "init", "--envtest", NULL };
-        char *envp[4] = { "LUCYK_STAGE=E", "HOME=/", "PATH=/bin:/sbin", NULL };
+        char *envp[4] = { "LUCYK_SELFTEST=1", "HOME=/", "PATH=/bin:/sbin", NULL };
 
         sse_load_all(exec_garbage);
         (void)bsd_execve("/bin/init", argv, envp);
@@ -2167,7 +2167,7 @@ __attribute__((noreturn)) static void envtest_main(int argc, char **argv,
     }
 
     static const char *const expected[3] = {
-        "LUCYK_STAGE=E", "HOME=/", "PATH=/bin:/sbin"
+        "LUCYK_SELFTEST=1", "HOME=/", "PATH=/bin:/sbin"
     };
 
     for (int i = 0; i < 3; i++) {
@@ -2263,8 +2263,8 @@ static void test_irq_create(void)
     write_text(1, "init: SYS_IRQ_CREATE hardware mint/delete verified\n");
 }
 
-/* Stage F: contiguous DMA + physical address lookup. */
-static void run_stage_f_tests(void)
+/* DMA: contiguous allocation + physical address lookup. */
+static void run_dma_tests(void)
 {
     /* --- SYS_DMA_ALLOC + SYS_FRAME_PHYS_ADDR + SYS_VSPACE_MAP --- */
     native_result_t dma = native_call(SYS_DMA_ALLOC, 2ULL, SYS_CAP_RIGHT_ALL,
@@ -2303,21 +2303,21 @@ static void run_stage_f_tests(void)
     (void)native_call(SYS_VSPACE_UNMAP, va, 0x2000ULL, 0, 0, 0);
     (void)native_call(SYS_CAP_DELETE, cap, 0, 0, 0, 0);
 
-    write_text(1, "init: Stage F SYS_DMA_ALLOC contiguous + "
+    write_text(1, "init: dma: SYS_DMA_ALLOC contiguous + "
                    "SYS_FRAME_PHYS_ADDR (DMA-only) verified\n");
 
     test_irq_create();
 }
 
-static void run_stage_e_tests(void)
+static void run_platform_tests(void)
 {
-    write_text(1, "init: Stage E tests\n");
+    write_text(1, "init: platform tests: sse, ipc, procfs, exec\n");
     test_sse_fork_preempt();
     test_framebuffer_caps();
     test_qos_ipc_grant();
     test_proc_sys();
     test_exec_envp();
-    write_text(1, "init: Stage E automated tests passed\n");
+    write_text(1, "init: platform tests passed\n");
 }
 
 static void print_motd(void)
@@ -2426,7 +2426,7 @@ static void launch_driverd(void)
     int64_t probe = bsd_open(DRIVERD_PATH, BSD_O_RDONLY, 0);
 
     if (probe < 0) {
-        return; /* no user-space driver bootstrap staged; skip silently */
+        return; /* no user-space driver bootstrap present; skip silently */
     }
     (void)bsd_close((int32_t)probe);
 
@@ -2627,7 +2627,7 @@ void user_main(int argc, char **argv, char **envp)
         envtest_main(argc, argv, envp);
     }
 
-    write_text(1, "init: PID 1 online (Kernel Stage C)\n");
+    write_text(1, "init: PID 1 online\n");
 
     if (bsd_getpid() != 1) {
         user_exit(1);
@@ -2647,18 +2647,18 @@ void user_main(int argc, char **argv, char **envp)
     test_cow_fork();
     test_fork_storm();
 
-    write_text(1, "init: Phase 3 automated tests passed\n");
+    write_text(1, "init: process: fork, exec and wait4 tests passed\n");
 
-    /* Stage C tests. */
+    /* Signal, TLS and memory-protection tests. */
     test_sigaction_basic();
     test_pgid_sigint();
     test_arch_prctl_tls();
     test_mprotect();
 
-    write_text(1, "init: Stage C automated tests passed\n");
+    write_text(1, "init: signals, TLS and mprotect tests passed\n");
 
     if (root_writable()) {
-        write_text(1, "init: Stage D2 ext2 tests\n");
+        write_text(1, "init: ext2 tests\n");
         test_ext2_motd();
         test_ext2_indirect();
         test_ext2_dirs();
@@ -2666,14 +2666,14 @@ void user_main(int argc, char **argv, char **envp)
         test_ext2_rmdir_nonempty();
         test_ext2_unlink_open();
         test_ext2_concurrent();
-        write_text(1, "init: Stage D2 ext2 persistence tests passed\n");
+        write_text(1, "init: ext2 persistence tests passed\n");
     } else {
-        write_text(1, "init: Stage D2 ext2 tests skipped: / is read-only "
+        write_text(1, "init: ext2 tests skipped: / is read-only "
                         "(initrd fallback)\n");
     }
 
-    run_stage_e_tests();
-    run_stage_f_tests();
+    run_platform_tests();
+    run_dma_tests();
 
     /* After all automated self-tests pass, optionally launch user-space
      * driverd (non-blocking); the shell starts right alongside it. */

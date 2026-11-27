@@ -6,7 +6,7 @@
 #include <string.h>
 #include <types.h>
 
-/* Phase 2 manages the first 4 GiB of physical memory. */
+/* Manages the first 4 GiB of physical memory. */
 #define PMM_MAX_PHYS   0x100000000ULL
 #define PMM_MAX_FRAMES (PMM_MAX_PHYS / PAGE_SIZE)
 

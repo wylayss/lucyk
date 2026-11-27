@@ -291,7 +291,7 @@ void user_main(int argc, char **argv, char **envp)
     (void)argv;
     (void)envp;
 
-    write_text(1, "\nLucyK BSD shell (Phase 3). Type 'help' for commands.\n");
+    write_text(1, "\nLucyK BSD shell. Type 'help' for commands.\n");
 
     for (;;) {
         write_text(1, "lucyk# ");

@@ -80,26 +80,26 @@ Numbers are from `src/include/bsd/syscall_bsd.h` / `user/bsd/bsd_user.h`; handle
 | `BSD_SYS_GETPPID` | `39` | `int32_t getppid(void)` | `proc.c` |
 | `BSD_SYS_DUP` | `41` | `int dup(int oldfd)` | `vfs.c` |
 | `BSD_SYS_PIPE` | `42` | `int pipe(int fds[2])` | `vfs.c` |
-| `BSD_SYS_SIGACTION` | `46` | `int sigaction(int sig, const bsd_sigaction_t *act, bsd_sigaction_t *oldact)` | `proc.c` (Stage B/C) |
+| `BSD_SYS_SIGACTION` | `46` | `int sigaction(int sig, const bsd_sigaction_t *act, bsd_sigaction_t *oldact)` | `proc.c` |
 | `BSD_SYS_GETGID` | `47` | `uint32_t getgid(void)` | `proc.c` |
-| `BSD_SYS_SIGPROCMASK` | `48` | `int sigprocmask(int how, const uint64_t *set, uint64_t *oldset)` | `proc.c` (Stage B/C) |
+| `BSD_SYS_SIGPROCMASK` | `48` | `int sigprocmask(int how, const uint64_t *set, uint64_t *oldset)` | `proc.c` |
 | `BSD_SYS_IOCTL` | `54` | `int ioctl(int fd, uint64_t req, void *arg)` | `syscall_bsd.c` / `console.c` |
-| `BSD_SYS_EXECVE` | `59` | `int execve(const char *path, char *const argv[], char *const envp[])` | `proc.c` (full `envp`, Stage E) |
+| `BSD_SYS_EXECVE` | `59` | `int execve(const char *path, char *const argv[], char *const envp[])` | `proc.c` (full `envp`) |
 | `BSD_SYS_MUNMAP` | `73` | `int munmap(void *addr, size_t len)` | `mmap.c` |
-| `BSD_SYS_MPROTECT` | `74` | `int mprotect(void *addr, size_t len, int prot)` | `mmap.c` (Stage C) |
-| `BSD_SYS_SETPGID` | `82` | `int setpgid(int32_t pid, int32_t pgid)` | `proc.c` (Stage B) |
-| `BSD_SYS_MKDIR` | `83` | `int mkdir(const char *path, uint32_t mode)` | `vfs.c` / `ext2.c` (Stage D) |
-| `BSD_SYS_RMDIR` | `84` | `int rmdir(const char *path)` | `vfs.c` / `ext2.c` (Stage D) |
-| `BSD_SYS_UNLINK` | `87` | `int unlink(const char *path)` | `vfs.c` / `ext2.c` (Stage D) |
+| `BSD_SYS_MPROTECT` | `74` | `int mprotect(void *addr, size_t len, int prot)` | `mmap.c` |
+| `BSD_SYS_SETPGID` | `82` | `int setpgid(int32_t pid, int32_t pgid)` | `proc.c` |
+| `BSD_SYS_MKDIR` | `83` | `int mkdir(const char *path, uint32_t mode)` | `vfs.c` / `ext2.c` |
+| `BSD_SYS_RMDIR` | `84` | `int rmdir(const char *path)` | `vfs.c` / `ext2.c` |
+| `BSD_SYS_UNLINK` | `87` | `int unlink(const char *path)` | `vfs.c` / `ext2.c` |
 | `BSD_SYS_DUP2` | `90` | `int dup2(int oldfd, int newfd)` | `vfs.c` |
-| `BSD_SYS_SIGRETURN` | `103` | `int sigreturn(bsd_sigframe_t *frame)` | `proc.c` (Stage B/C) |
-| `BSD_SYS_ARCH_PRCTL` | `158` | `int arch_prctl(int code, uint64_t addr)` | `proc.c` (Stage C) |
+| `BSD_SYS_SIGRETURN` | `103` | `int sigreturn(bsd_sigframe_t *frame)` | `proc.c` |
+| `BSD_SYS_ARCH_PRCTL` | `158` | `int arch_prctl(int code, uint64_t addr)` | `proc.c` |
 | `BSD_SYS_FSTAT` | `189` | `int fstat(int fd, bsd_stat_t *st)` | `syscall_bsd.c` / `vfs.c` |
 | `BSD_SYS_STAT` | `190` | `int stat(const char *path, bsd_stat_t *st)` | `vfs.c` |
 | `BSD_SYS_GETDENTS` | `196` | `ssize_t getdents(int fd, void *buf, size_t count)` | `syscall_bsd.c` / `vfs.c` |
 | `BSD_SYS_MMAP` | `197` | `void *mmap(void *addr, size_t len, int prot, int flags, int fd, int64_t off)` | `mmap.c` |
 | `BSD_SYS_LSEEK` | `199` | `int64_t lseek(int fd, int64_t offset, int whence)` | `vfs.c` |
-| `BSD_SYS_GETPGID` | `207` | `int32_t getpgid(int32_t pid)` | `proc.c` (Stage B) |
+| `BSD_SYS_GETPGID` | `207` | `int32_t getpgid(int32_t pid)` | `proc.c` |
 | `BSD_SYS_BRK` | `214` | `vaddr_t brk(vaddr_t new_brk)` | `mmap.c` |
 | `BSD_SYS_GETCWD` | `326` | `ssize_t getcwd(char *buf, size_t size)` | `vfs.c` |
 
@@ -257,7 +257,7 @@ BSD processes may also issue native microkernel syscalls (bit 63 set) such as
 `SYS_THREAD_SET_QOS`, `SYS_TASK_ID`, `SYS_CAP_GRANT` and `SYS_VSPACE_MAP`; those return
 `sys_status_t` codes, not errno values ([`SYSCALL_ABI.md`](SYSCALL_ABI.md)).
 
-**Stage F native syscalls** (bit 63, [`SYSCALL_ABI.md`](SYSCALL_ABI.md)): `SYS_DMA_ALLOC`
+**Native hardware and DMA syscalls** (bit 63, [`SYSCALL_ABI.md`](SYSCALL_ABI.md)): `SYS_DMA_ALLOC`
 (`CAP_FRAME_DMA`, contiguous, `PTE_NX`, 256-page cap), `SYS_FRAME_PHYS_ADDR` (DMA-only
 physical base), `SYS_PCI_CLAIM_BAR`, `SYS_PCI_ALLOC_MSI` (`CAP_OBJ_IRQ`, MSI/MSI-X, LAPIC
 `0x50..0x6F`, `CAP_OBJ_HARDWARE`/PID-1 privileged), `SYS_FBCON_RELEASE`. AHCI SATA `ext2`

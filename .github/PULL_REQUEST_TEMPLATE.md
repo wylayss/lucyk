@@ -28,7 +28,7 @@ $ make run-smp4           # -cpu max -smp 4
 
 - [ ] `./scripts/verify.sh` (or `make verify`) passes **all four gates**: clean build with 0
       warnings, architectural boundary/hygiene scan, headless QEMU boots on `-smp 1` and
-      `-cpu max -smp 4` (Stage A–D self-tests, 0 leaked frames, `lucyk#` prompt), and
+      `-cpu max -smp 4` (kernel self-tests, 0 leaked frames, `lucyk#` prompt), and
       `e2fsck` integrity.
 - [ ] `make clean && make` completes with **0 warnings** under `-Wall -Wextra -Werror`.
 - [ ] No BSD/POSIX identifiers leak into `src/mk/` or `src/arch/` (or `src/io/`); `src/io/`

@@ -49,7 +49,7 @@ struct vnode {
     const char  *name;      /* Final path component; NULL when unlinked */
 };
 
-/* Open file description shared by dup()/fork() in later phases. */
+/* Open file description shared by dup()/fork() in later operations. */
 struct file {
     spinlock_t lock;        /* serializes offset + regular-file I/O */
     vnode_t *vnode;
