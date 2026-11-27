@@ -5,6 +5,7 @@
 
 /* Native ABI values used by the Stage E tests (docs/SYSCALL_ABI.md). */
 #define SYS_ERR_INVAL_USER      (-1)
+#define SYS_ERR_CAP_INVALID_USER (-3)
 #define SYS_ERR_CAP_RIGHTS_USER (-4)
 #define SYS_CAP_RIGHT_READ      0x1ULL
 #define SYS_CAP_RIGHT_ALL       0xFULL
@@ -2181,6 +2182,85 @@ __attribute__((noreturn)) static void envtest_main(int argc, char **argv,
 
 #define SYS_VSPACE_PROT_WRITE 0x1ULL
 
+/* Discover a held CAP_OBJ_HARDWARE capability. There is no capability-query
+ * syscall; SYS_IRQ_CREATE both reports whether a slot names a hardware
+ * authority with CAP_RIGHT_WRITE and (as a side effect) mints an IRQ which
+ * is immediately deleted. Returns the slot, or 0 if none. */
+static uint64_t find_hardware_cap(void)
+{
+    for (uint64_t slot = 1; slot <= 256; slot++) {
+        native_result_t r =
+            native_call(SYS_IRQ_CREATE, slot, SYS_CAP_RIGHT_ALL, 0, 0, 0);
+
+        if (r.status == 0) {
+            (void)native_call(SYS_CAP_DELETE, r.rdx, 0, 0, 0, 0);
+            return slot;
+        }
+    }
+    return 0;
+}
+
+/* SYS_IRQ_CREATE: a CAP_OBJ_HARDWARE holder mints a fresh unbound
+ * CAP_OBJ_IRQ and deletes it; non-hardware caps are rejected; unknown
+ * rights bits are rejected; a hardware cap without CAP_RIGHT_WRITE is
+ * rejected. */
+static void test_irq_create(void)
+{
+    uint64_t hw = find_hardware_cap();
+
+    if (hw == 0) {
+        fail(610);
+    }
+
+    /* Non-hardware capability rejected (CAP_OBJ_FRAME boot cap). */
+    if (native_call(SYS_IRQ_CREATE, DISPLAY_BOOT_CAP_FRAMEBUFFER,
+                    SYS_CAP_RIGHT_ALL, 0, 0, 0).status !=
+            SYS_ERR_CAP_INVALID_USER) {
+        fail(611);
+    }
+    /* Empty slot rejected. */
+    if (native_call(SYS_IRQ_CREATE, 255, SYS_CAP_RIGHT_ALL, 0, 0, 0).status !=
+            SYS_ERR_CAP_INVALID_USER) {
+        fail(612);
+    }
+    /* Rights with bits outside CAP_RIGHT_ALL rejected. */
+    if (native_call(SYS_IRQ_CREATE, hw, SYS_CAP_RIGHT_ALL | 0x10ULL, 0, 0, 0)
+            .status != SYS_ERR_INVAL_USER) {
+        fail(613);
+    }
+    /* Hardware capability lacking CAP_RIGHT_WRITE rejected. */
+    native_result_t ro = native_call(SYS_CAP_DERIVE, hw, SYS_CAP_RIGHT_READ,
+                                     0, 0, 0);
+
+    if (ro.status != 0) {
+        fail(614);
+    }
+    if (native_call(SYS_IRQ_CREATE, ro.rdx, SYS_CAP_RIGHT_ALL, 0, 0, 0)
+            .status != SYS_ERR_CAP_RIGHTS_USER) {
+        fail(615);
+    }
+    (void)native_call(SYS_CAP_DELETE, ro.rdx, 0, 0, 0, 0);
+
+    /* CAP_OBJ_HARDWARE holder can mint a CAP_OBJ_IRQ ... */
+    native_result_t r = native_call(SYS_IRQ_CREATE, hw, SYS_CAP_RIGHT_ALL, 0,
+                                    0, 0);
+
+    if (r.status != 0 || r.rdx == 0) {
+        fail(616);
+    }
+    uint64_t irq = r.rdx;
+    /* ... and delete it. */
+    if (native_call(SYS_CAP_DELETE, irq, 0, 0, 0, 0).status != 0) {
+        fail(617);
+    }
+    /* The slot is empty after deletion. */
+    if (native_call(SYS_CAP_DELETE, irq, 0, 0, 0, 0).status == 0) {
+        fail(618);
+    }
+
+    write_text(1, "init: SYS_IRQ_CREATE hardware mint/delete verified\n");
+}
+
 /* Stage F: contiguous DMA + physical address lookup. */
 static void run_stage_f_tests(void)
 {
@@ -2223,6 +2303,8 @@ static void run_stage_f_tests(void)
 
     write_text(1, "init: Stage F SYS_DMA_ALLOC contiguous + "
                    "SYS_FRAME_PHYS_ADDR (DMA-only) verified\n");
+
+    test_irq_create();
 }
 
 static void run_stage_e_tests(void)
@@ -2256,6 +2338,145 @@ static void print_motd(void)
 
     (void)bsd_close((int32_t)fd);
     write_all(1, "\n", 1);
+}
+
+#define DRIVERD_PATH "/sbin/drivers/driverd"
+
+static size_t append_str(char *buf, size_t pos, size_t cap, const char *s)
+{
+    while (*s != '\0' && pos + 1 < cap) {
+        buf[pos++] = *s++;
+    }
+    return pos;
+}
+
+static size_t append_u64(char *buf, size_t pos, size_t cap, uint64_t value)
+{
+    char tmp[20];
+    size_t n = 0;
+
+    if (value == 0) {
+        if (pos + 1 < cap) {
+            buf[pos++] = '0';
+        }
+        return pos;
+    }
+    while (value != 0 && n < sizeof(tmp)) {
+        tmp[n++] = (char)('0' + (value % 10U));
+        value /= 10U;
+    }
+    while (n != 0 && pos + 1 < cap) {
+        buf[pos++] = tmp[--n];
+    }
+    return pos;
+}
+
+/* If /sbin/drivers/driverd exists on /, fork a non-blocking child, query its
+ * microkernel task id (SYS_TASK_ID), grant the boot CAP_OBJ_HARDWARE into the
+ * child (SYS_CAP_GRANT, destination handle in rdx), then execve driverd in
+ * the child with LUCY_HW_CAP=<slot> in envp. init does not wait; the
+ * interactive shell starts alongside driverd. */
+static void launch_driverd(void)
+{
+    int64_t probe = bsd_open(DRIVERD_PATH, BSD_O_RDONLY, 0);
+
+    if (probe < 0) {
+        return; /* no user-space driver bootstrap staged; skip silently */
+    }
+    (void)bsd_close((int32_t)probe);
+
+    uint64_t hw_cap = find_hardware_cap();
+
+    if (hw_cap == 0) {
+        write_text(1, "init: no CAP_OBJ_HARDWARE; skipping driverd\n");
+        return;
+    }
+
+    int32_t to_parent[2];
+    int32_t to_child[2];
+
+    if (bsd_pipe(to_parent) != 0) {
+        return;
+    }
+    if (bsd_pipe(to_child) != 0) {
+        (void)bsd_close(to_parent[0]);
+        (void)bsd_close(to_parent[1]);
+        return;
+    }
+
+    int64_t pid = bsd_fork();
+
+    if (pid < 0) {
+        write_text(1, "init: fork for driverd failed\n");
+        (void)bsd_close(to_parent[0]);
+        (void)bsd_close(to_parent[1]);
+        (void)bsd_close(to_child[0]);
+        (void)bsd_close(to_child[1]);
+        return;
+    }
+
+    if (pid == 0) {
+        /* Child. */
+        (void)bsd_close(to_parent[0]);
+        (void)bsd_close(to_child[1]);
+
+        uint64_t child_task = native_call(SYS_TASK_ID, 0, 0, 0, 0, 0).rdx;
+        uint64_t slot = 0;
+
+        if (bsd_write(to_parent[1], &child_task, sizeof(child_task)) !=
+                (int64_t)sizeof(child_task) ||
+            bsd_read(to_child[0], &slot, sizeof(slot)) !=
+                (int64_t)sizeof(slot)) {
+            user_exit(126);
+        }
+        (void)bsd_close(to_parent[1]);
+        (void)bsd_close(to_child[0]);
+
+        char envbuf[64];
+        size_t n = 0;
+
+        n = append_str(envbuf, n, sizeof(envbuf), "LUCY_HW_CAP=");
+        n = append_u64(envbuf, n, sizeof(envbuf), slot);
+        envbuf[n < sizeof(envbuf) ? n : sizeof(envbuf) - 1] = '\0';
+
+        char *argv[2];
+        char *envp[2];
+
+        argv[0] = "driverd";
+        argv[1] = NULL;
+        envp[0] = envbuf;
+        envp[1] = NULL;
+
+        (void)bsd_execve(DRIVERD_PATH, argv, envp);
+        write_text(1, "init: cannot exec " DRIVERD_PATH "\n");
+        user_exit(127);
+    }
+
+    /* Parent. */
+    (void)bsd_close(to_parent[1]);
+    (void)bsd_close(to_child[0]);
+
+    uint64_t child_task = 0;
+    uint64_t slot = 0;
+
+    if (bsd_read(to_parent[0], &child_task, sizeof(child_task)) ==
+            (int64_t)sizeof(child_task) &&
+        child_task != 0) {
+        native_result_t grant =
+            native_call(SYS_CAP_GRANT, hw_cap, child_task, SYS_CAP_RIGHT_ALL,
+                        0, 0);
+
+        if (grant.status == 0) {
+            slot = grant.rdx; /* destination handle in the child, rdx */
+        } else {
+            write_text(1, "init: SYS_CAP_GRANT hardware to driverd failed\n");
+        }
+    }
+    (void)bsd_write(to_child[1], &slot, sizeof(slot));
+    (void)bsd_close(to_parent[0]);
+    (void)bsd_close(to_child[1]);
+
+    /* Non-blocking: do not wait4() the driverd child. */
 }
 
 static void spawn_shell(void)
@@ -2348,6 +2569,10 @@ void user_main(int argc, char **argv, char **envp)
 
     run_stage_e_tests();
     run_stage_f_tests();
+
+    /* After all automated self-tests pass, optionally launch user-space
+     * driverd (non-blocking); the shell starts right alongside it. */
+    launch_driverd();
 
     print_motd();
     spawn_shell();

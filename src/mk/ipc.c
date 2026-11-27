@@ -822,7 +822,9 @@ static void irq_object_release(mk_object_t *object)
 
 mk_object_t *cap_irq_object_create(uint8_t vector)
 {
-    if (!irq_vector_valid(vector)) {
+    /* vector 0 mints a fresh unbound object: no interrupt vector is claimed
+     * and nothing is bound until e.g. SYS_PCI_ALLOC_MSI assigns one. */
+    if (vector != 0 && !irq_vector_valid(vector)) {
         return NULL;
     }
 

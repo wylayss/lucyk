@@ -19,6 +19,11 @@ ISO       := $(BUILD_DIR)/os.iso
 DISK      := $(BUILD_DIR)/disk.img
 DISK_MB   := 32
 
+# Optional user-space driver stack (lucy-driverkit). When
+# $(DRIVERKIT_DIR)/driverd exists it is bundled into /sbin/drivers of the
+# ext2 staging rootfs; absent (e.g. standalone CI) it is skipped silently.
+DRIVERKIT_DIR ?= ../lucy-driverkit/target/x86_64-unknown-none/release
+
 # Freestanding compiler headers (stdint.h, stddef.h, stdarg.h, ...).
 CLANG_INC := $(shell $(CC) -print-resource-dir)/include
 
@@ -66,7 +71,7 @@ C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(C_SRCS))
 ASM_OBJS := $(patsubst src/%.asm,$(OBJ_DIR)/%.asm.o,$(ASM_SRCS))
 OBJS     := $(C_OBJS) $(ASM_OBJS)
 
-.PHONY: all clean run run-uefi run-smp1 run-smp4 run-ahci verify limine
+.PHONY: all clean run run-uefi run-smp1 run-smp4 run-ahci run-net verify limine
 
 all: $(ISO) $(DISK)
 
@@ -81,6 +86,18 @@ $(DISK): $(USER_BSD_INIT) $(USER_BSD_SH) $(USER_BSD_ECHO) Makefile
 	@chmod 0755 $(EXT2_ROOT)/bin/init $(EXT2_ROOT)/bin/sh \
 		$(EXT2_ROOT)/bin/echo
 	@chmod 0777 $(EXT2_ROOT)/tmp
+	@if [ -f "$(DRIVERKIT_DIR)/driverd" ]; then \
+		mkdir -p "$(EXT2_ROOT)/sbin/drivers"; \
+		cp -p "$(DRIVERKIT_DIR)/driverd" \
+			"$(EXT2_ROOT)/sbin/drivers/driverd"; \
+		for f in "$(DRIVERKIT_DIR)"/*; do \
+			[ -f "$$f" ] || continue; \
+			[ "$$f" = "$(DRIVERKIT_DIR)/driverd" ] && continue; \
+			cp -p "$$f" "$(EXT2_ROOT)/sbin/drivers/"; \
+		done; \
+		chmod 0755 "$(EXT2_ROOT)/sbin/drivers"/*; \
+		echo "[driverkit] bundled driverd + drivers from $(DRIVERKIT_DIR)"; \
+	fi
 	@printf '%s\n' \
 		'LucyK ext2 root filesystem (Kernel Stage D2)' \
 		'This /etc/motd lives on the writable ext2 volume.' \
@@ -217,6 +234,12 @@ run-smp4: $(ISO) $(DISK)
 		-no-reboot -no-shutdown \
 		-drive file=$(DISK),if=none,id=hd0,format=raw \
 		-device virtio-blk-pci,drive=hd0
+
+run-net: $(ISO) $(DISK)
+	$(QEMU) -M q35 -m 512M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown \
+		-drive file=$(DISK),if=none,id=hd0,format=raw \
+		-device virtio-blk-pci,drive=hd0 \
+		-netdev user,id=net0 -device e1000,netdev=net0
 
 run-ahci: $(ISO) $(DISK)
 	$(QEMU) -M q35 -m 512M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown \

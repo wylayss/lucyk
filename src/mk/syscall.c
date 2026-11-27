@@ -265,6 +265,50 @@ static void dispatch_irq_ack(task_t *task, syscall_frame_t *frame)
     frame->rax = status;
 }
 
+/* SYS_IRQ_CREATE(hw_cap, rights): privileged. hw_cap must name a
+ * CAP_OBJ_HARDWARE capability with CAP_RIGHT_WRITE (SYS_ERR_CAP_INVALID /
+ * SYS_ERR_CAP_RIGHTS otherwise). rights must have no bits outside
+ * CAP_RIGHT_ALL (SYS_ERR_INVAL). Mints a fresh unbound CAP_OBJ_IRQ
+ * (cap_irq_object_create(0)) with (CAP_RIGHT_ALL & rights), installs it in
+ * the caller's capability table, returns the new handle in rdx. */
+static void dispatch_irq_create(task_t *task, syscall_frame_t *frame)
+{
+    uint64_t rights = frame->rsi;
+
+    void *hw = NULL;
+    sys_status_t status = cap_lookup_retained(task->caps, (cap_t)frame->rdi,
+                                              CAP_OBJ_HARDWARE, CAP_RIGHT_WRITE,
+                                              &hw, NULL);
+    if (status != SYS_OK) {
+        frame->rax = status;
+        return;
+    }
+    mk_object_release((mk_object_t *)hw);
+
+    if ((rights & ~CAP_RIGHT_ALL) != 0) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    mk_object_t *object = cap_irq_object_create(0);
+    if (object == NULL) {
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    cap_t cap = CAP_NULL;
+    status = cap_insert(task->caps, CAP_OBJ_IRQ, object,
+                        CAP_RIGHT_ALL & rights, 0, &cap);
+
+    /* The table holds its own reference; drop the creator's. */
+    mk_object_release(object);
+
+    frame->rax = status;
+    if (status == SYS_OK) {
+        frame->rdx = (uint64_t)cap;
+    }
+}
+
 static void dispatch_range_unmap(task_t *task, syscall_frame_t *frame)
 {
     uint64_t vaddr = frame->rdi;
@@ -462,8 +506,11 @@ static void dispatch_pci_claim_bar(task_t *task, syscall_frame_t *frame)
     }
 
     cap_t cap = CAP_NULL;
+    /* `CAP_RIGHT_GRANT` lets the hardware manager pass the BAR to the driver. */
     sys_status_t status = cap_insert(task->caps, CAP_OBJ_FRAME, object,
-                                     CAP_RIGHT_READ | CAP_RIGHT_WRITE, 0, &cap);
+                                     CAP_RIGHT_READ | CAP_RIGHT_WRITE |
+                                         CAP_RIGHT_GRANT,
+                                     0, &cap);
     mk_object_release(object);
 
     if (status != SYS_OK) {
@@ -657,6 +704,10 @@ void syscall_dispatch(syscall_frame_t *frame)
 
     case SYS_IRQ_ACK:
         dispatch_irq_ack(task, frame);
+        break;
+
+    case SYS_IRQ_CREATE:
+        dispatch_irq_create(task, frame);
         break;
 
     case SYS_IPC_CALL:
