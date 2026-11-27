@@ -3,6 +3,7 @@
 #include <kalloc.h>
 #include <klog.h>
 #include <lapic.h>
+#include <limine.h>
 #include <pmm.h>
 #include <sched.h>
 #include <smp.h>
@@ -11,6 +12,9 @@
 #include <task.h>
 #include <types.h>
 #include <vspace.h>
+
+extern volatile struct limine_hhdm_request hhdm_request;
+extern volatile struct limine_memmap_request memmap_request;
 
 #define IA32_EFER 0xC0000080U
 #define EFER_NXE  (1ULL << 11)
@@ -172,6 +176,92 @@ static void cpu_enable_write_protect(void)
     __asm__ volatile("mov %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
+/* True when `vaddr` already has a kernel-half translation, including one from
+ * a huge ancestor (Limine maps the HHDM with large pages; walk() refuses
+ * those). Only called from vspace_init(), before the vspace is shared. */
+static bool kernel_mapping_present(vaddr_t vaddr)
+{
+    uint64_t entry = kernel_vspace.pml4[PML4_INDEX(vaddr)];
+
+    if ((entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    if ((entry & PTE_HUGE) != 0) {
+        return true;
+    }
+
+    uint64_t *pdpt = (uint64_t *)pmm_phys_to_virt(entry & PTE_ADDR_MASK);
+    entry = pdpt[PDPT_INDEX(vaddr)];
+    if ((entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    if ((entry & PTE_HUGE) != 0) {
+        return true;
+    }
+
+    uint64_t *pd = (uint64_t *)pmm_phys_to_virt(entry & PTE_ADDR_MASK);
+    entry = pd[PD_INDEX(vaddr)];
+    if ((entry & PTE_PRESENT) == 0) {
+        return false;
+    }
+    if ((entry & PTE_HUGE) != 0) {
+        return true;
+    }
+
+    uint64_t *pt = (uint64_t *)pmm_phys_to_virt(entry & PTE_ADDR_MASK);
+    return (pt[PT_INDEX(vaddr)] & PTE_PRESENT) != 0;
+}
+
+/* Limine's HHDM omits ACPI RECLAIMABLE/NVS regions, so the RSDP, XSDT and
+ * MADT can fault when they live in one. Map every page of those regions at
+ * `hhdm + base` RW/NX, leaving already-mapped (large-page) ranges alone. The
+ * frames stay reserved: no OWNED flag, pmm_init() never frees them. */
+static void map_acpi_hhdm_ranges(void)
+{
+    struct limine_memmap_response *memmap = memmap_request.response;
+
+    if (memmap == NULL || hhdm_request.response == NULL) {
+        return;
+    }
+
+    uint64_t hhdm = hhdm_request.response->offset;
+    uint64_t mapped = 0;
+    uint64_t failed = 0;
+
+    for (uint64_t i = 0; i < memmap->entry_count; i++) {
+        struct limine_memmap_entry *entry = memmap->entries[i];
+
+        if (entry->type != LIMINE_MEMMAP_ACPI_RECLAIMABLE &&
+            entry->type != LIMINE_MEMMAP_ACPI_NVS) {
+            continue;
+        }
+
+        uint64_t end = entry->base + entry->length;
+        if (entry->length == 0 || end < entry->base) {
+            continue;
+        }
+
+        for (paddr_t phys = PAGE_ALIGN_DOWN(entry->base);
+             phys < PAGE_ALIGN_UP(end); phys += PAGE_SIZE) {
+            vaddr_t vaddr = hhdm + phys;
+
+            if (kernel_mapping_present(vaddr)) {
+                continue;
+            }
+            if (vspace_map_kernel(vaddr, phys, VSPACE_PROT_WRITE) != SYS_OK) {
+                failed++;
+                continue;
+            }
+            mapped++;
+        }
+    }
+
+    klog(KLOG_DEBUG, "vspace: mapped %lu ACPI/NVS HHDM pages", mapped);
+    if (failed != 0) {
+        klog(KLOG_WARN, "vspace: %lu ACPI/NVS HHDM pages unmapped", failed);
+    }
+}
+
 void vspace_init(void)
 {
     uint64_t cr3;
@@ -210,6 +300,8 @@ void vspace_init(void)
     }
 
     klog(KLOG_DEBUG, "vspace: pre-allocated %lu kernel PDPTs", preallocated);
+
+    map_acpi_hhdm_ranges();
 }
 
 vspace_t *vspace_kernel(void)
