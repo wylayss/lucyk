@@ -74,7 +74,7 @@ user/bsd/            # Freestanding BSD Ring 3 programs (/bin/init, /bin/sh, /bi
 ```
 
 `vfs_init()` mounts the writable `ext2` root at `/` when the VirtIO-Blk device is present.
-**Stage F AHCI.** A writable `ext2` root can also mount on an AHCI 1.0 SATA `blkdev_t` (`src/io/ahci.c`, `ahci_init()`, `blkdev_primary()` AHCI fallback; `make run-ahci`); read-only `initrd` fallback unchanged.
+**AHCI.** A writable `ext2` root can also mount on an AHCI 1.0 SATA `blkdev_t` (`src/io/ahci.c`, `ahci_init()`, `blkdev_primary()` AHCI fallback; `make run-ahci`); read-only `initrd` fallback unchanged.
 
 If no disk exists or the mount fails, `bsd_init()` falls back to the Limine `initrd.tar`
 module (read-only USTAR). `bsd_init()` then binds `/dev` and `/dev/console`, mounts `/proc`

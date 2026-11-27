@@ -6,7 +6,7 @@
 #   1. Clean build:            make clean && make (0 warnings/errors, -Werror)
 #   2. Boundary & hygiene:     no POSIX/BSD leaks, no Mach terms, no stubs
 #   3. Headless QEMU boots:    -smp 1 and -cpu max -smp 4 reach the shell prompt
-#                              with all Stage A-D self-tests and 0 leaked frames
+#                              with all kernel self-tests and 0 leaked frames
 #   4. Filesystem integrity:   e2fsck -fn build/disk.img
 #
 # Usage:
@@ -152,8 +152,8 @@ boot_gate() {
         'ext2: mounted at /' \
         'smp stress:' \
         'cow stress:' \
-        'init: Stage C automated tests passed' \
-        'init: Stage D2 ext2 persistence tests passed' \
+        'init: signals, TLS and mprotect tests passed' \
+        'init: ext2 persistence tests passed' \
         '0 leaked frames' \
         'lucyk#'; do
         if ! grep -qaF -- "$marker" "$log"; then
@@ -161,7 +161,7 @@ boot_gate() {
             fail "$name: missing required marker: '$marker'"
         fi
     done
-    ok "$name: Stage A-D self-tests passed, 0 leaked frames, shell prompt reached"
+    ok "$name: kernel self-tests passed, 0 leaked frames, shell prompt reached"
 }
 
 boot_gate smp1 -smp 1

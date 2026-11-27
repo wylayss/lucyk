@@ -181,7 +181,7 @@ int32_t bsd_proc_getpgid(int32_t pid);
 sys_status_t bsd_proc_arch_prctl(int32_t code, uint64_t addr,
                                  uint64_t *result);
 
-/* BSD Phase 3 process creation, program execution and child reaping. */
+/* BSD process creation, program execution and child reaping. */
 int32_t bsd_proc_fork(syscall_frame_t *parent_frame);
 sys_status_t bsd_proc_execve(syscall_frame_t *frame, const char *upath,
                              char *const uargv[], char *const uenvp[]);

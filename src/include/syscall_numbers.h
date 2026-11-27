@@ -34,7 +34,7 @@
 /* SYS_CAP_GRANT target selector naming the calling task itself. */
 #define SYS_CAP_GRANT_SELF  0ULL
 
-/* Stage F. */
+/* Hardware and DMA syscalls. */
 #define SYS_DMA_ALLOC        0x8000000000000060ULL /* (page_count, rights) -> CAP_FRAME_DMA */
 #define SYS_FRAME_PHYS_ADDR  0x8000000000000061ULL /* (frame_cap) -> phys (CAP_FRAME_DMA only) */
 #define SYS_PCI_CLAIM_BAR    0x8000000000000062ULL /* (bdf, bar_index) -> {cap, offset} */

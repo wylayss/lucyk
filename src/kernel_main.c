@@ -156,7 +156,7 @@ static void log_memory_map(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Phase 2 boot-time self-tests                                               */
+/* Boot-time self-tests */
 /* ------------------------------------------------------------------------- */
 
 static void self_test_pmm(void)
@@ -533,7 +533,7 @@ static void wait_for_reaped(uint64_t target)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Phase 3 adversarial stress test                                            */
+/* Adversarial stress tests */
 /* ------------------------------------------------------------------------- */
 
 #define STRESS_TASK_COUNT       4
@@ -876,17 +876,17 @@ static void run_smp_stress_test(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Phase 4 capability, endpoint IPC and notification self-tests               */
+/* Capability, endpoint IPC and notification self-tests */
 /* ------------------------------------------------------------------------- */
 
-#define PHASE4_SERVER_BADGE   0x1111111111111111ULL
-#define PHASE4_CLIENT_BADGE   0x2222222222222222ULL
-#define PHASE4_READONLY_BADGE 0x3333333333333333ULL
-#define PHASE4_NOTIFY_BITS    0xA5A50000A5A50000ULL
-#define PHASE4_IRQ_BIT        (1ULL << 7)
-#define PHASE4_IRQ_VECTOR     0x30U
+#define IPC_SERVER_BADGE     0x1111111111111111ULL
+#define IPC_CLIENT_BADGE     0x2222222222222222ULL
+#define IPC_READONLY_BADGE   0x3333333333333333ULL
+#define NOTIFY_BITS          0xA5A50000A5A50000ULL
+#define IPC_IRQ_BIT         (1ULL << 7)
+#define IPC_IRQ_VECTOR      0x30U
 
-typedef struct phase4_ipc_ctx {
+typedef struct ipc_test_ctx {
     task_t *client_task;
     task_t *server_task;
     cap_t server_cap;
@@ -904,13 +904,13 @@ typedef struct phase4_ipc_ctx {
     bool server_delay;
     volatile bool server_done;
     volatile bool client_done;
-} phase4_ipc_ctx_t;
+} ipc_test_ctx_t;
 
-static phase4_ipc_ctx_t phase4_ipc;
+static ipc_test_ctx_t ipc_test;
 
-static void phase4_server_entry(void *arg)
+static void ipc_server_entry(void *arg)
 {
-    phase4_ipc_ctx_t *ctx = (phase4_ipc_ctx_t *)arg;
+    ipc_test_ctx_t *ctx = (ipc_test_ctx_t *)arg;
     thread_t *sender = NULL;
     uint64_t reply[4] = { 0, 0, 0, 0 };
 
@@ -929,7 +929,7 @@ static void phase4_server_entry(void *arg)
             }
             reply[i] = ~ctx->server_msg[i];
         }
-        if (ctx->server_seen_badge != PHASE4_CLIENT_BADGE) {
+        if (ctx->server_seen_badge != IPC_CLIENT_BADGE) {
             status = SYS_ERR_INVAL;
         }
 
@@ -944,9 +944,9 @@ static void phase4_server_entry(void *arg)
     thread_exit();
 }
 
-static void phase4_client_entry(void *arg)
+static void ipc_client_entry(void *arg)
 {
-    phase4_ipc_ctx_t *ctx = (phase4_ipc_ctx_t *)arg;
+    ipc_test_ctx_t *ctx = (ipc_test_ctx_t *)arg;
     uint64_t reply[4] = { 0, 0, 0, 0 };
     uint64_t badge = 0;
 
@@ -968,89 +968,89 @@ static void phase4_client_entry(void *arg)
     thread_exit();
 }
 
-static void phase4_ipc_round(bool server_delay)
+static void ipc_test_round(bool server_delay)
 {
-    phase4_ipc.server_delay = server_delay;
-    phase4_ipc.server_done = false;
-    phase4_ipc.client_done = false;
-    phase4_ipc.server_status = SYS_ERR_BUSY;
-    phase4_ipc.client_status = SYS_ERR_BUSY;
-    phase4_ipc.rights_status = SYS_ERR_BUSY;
-    phase4_ipc.server_seen_badge = 0;
-    phase4_ipc.client_reply_badge = 0;
+    ipc_test.server_delay = server_delay;
+    ipc_test.server_done = false;
+    ipc_test.client_done = false;
+    ipc_test.server_status = SYS_ERR_BUSY;
+    ipc_test.client_status = SYS_ERR_BUSY;
+    ipc_test.rights_status = SYS_ERR_BUSY;
+    ipc_test.server_seen_badge = 0;
+    ipc_test.client_reply_badge = 0;
     for (size_t i = 0; i < 4; i++) {
-        phase4_ipc.server_msg[i] = 0;
-        phase4_ipc.client_reply[i] = 0;
+        ipc_test.server_msg[i] = 0;
+        ipc_test.client_reply[i] = 0;
     }
 
     uint64_t reaped_base = sched_reaped_count();
 
-    if (thread_create(phase4_ipc.server_task, phase4_server_entry,
-                      &phase4_ipc) == NULL ||
-        thread_create(phase4_ipc.client_task, phase4_client_entry,
-                      &phase4_ipc) == NULL) {
-        kpanic("phase4: cannot create IPC worker threads");
+    if (thread_create(ipc_test.server_task, ipc_server_entry,
+                      &ipc_test) == NULL ||
+        thread_create(ipc_test.client_task, ipc_client_entry,
+                      &ipc_test) == NULL) {
+        kpanic("ipc: cannot create IPC worker threads");
     }
 
     uint64_t deadline = sched_tick_count() + 2000;
-    while (!phase4_ipc.server_done || !phase4_ipc.client_done) {
+    while (!ipc_test.server_done || !ipc_test.client_done) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase4: cross-task IPC timed out");
+            kpanic("ipc: cross-task IPC timed out");
         }
         thread_sleep_ms(1);
     }
 
     wait_for_reaped(reaped_base + 2);
 
-    if (phase4_ipc.server_status != SYS_OK) {
-        kpanic("phase4: server IPC failed (%ld)", phase4_ipc.server_status);
+    if (ipc_test.server_status != SYS_OK) {
+        kpanic("ipc: server IPC failed (%ld)", ipc_test.server_status);
     }
-    if (phase4_ipc.client_status != SYS_OK) {
-        kpanic("phase4: client IPC failed (%ld)", phase4_ipc.client_status);
+    if (ipc_test.client_status != SYS_OK) {
+        kpanic("ipc: client IPC failed (%ld)", ipc_test.client_status);
     }
-    if (phase4_ipc.rights_status != SYS_ERR_CAP_RIGHTS) {
-        kpanic("phase4: READ-only cap was not rejected for CALL (%ld)",
-               phase4_ipc.rights_status);
+    if (ipc_test.rights_status != SYS_ERR_CAP_RIGHTS) {
+        kpanic("ipc: READ-only cap was not rejected for CALL (%ld)",
+               ipc_test.rights_status);
     }
-    if (phase4_ipc.server_seen_badge != PHASE4_CLIENT_BADGE) {
-        kpanic("phase4: server saw badge 0x%016lx", phase4_ipc.server_seen_badge);
+    if (ipc_test.server_seen_badge != IPC_CLIENT_BADGE) {
+        kpanic("ipc: server saw badge 0x%016lx", ipc_test.server_seen_badge);
     }
-    if (phase4_ipc.client_reply_badge != PHASE4_CLIENT_BADGE) {
-        kpanic("phase4: client reply badge 0x%016lx",
-               phase4_ipc.client_reply_badge);
+    if (ipc_test.client_reply_badge != IPC_CLIENT_BADGE) {
+        kpanic("ipc: client reply badge 0x%016lx",
+               ipc_test.client_reply_badge);
     }
 
     for (size_t i = 0; i < 4; i++) {
-        if (phase4_ipc.server_msg[i] != phase4_ipc.client_msg[i]) {
-            kpanic("phase4: message word %lu mismatch", i);
+        if (ipc_test.server_msg[i] != ipc_test.client_msg[i]) {
+            kpanic("ipc: message word %lu mismatch", i);
         }
-        if (phase4_ipc.client_reply[i] != phase4_ipc.reply_expected[i]) {
-            kpanic("phase4: reply word %lu mismatch", i);
+        if (ipc_test.client_reply[i] != ipc_test.reply_expected[i]) {
+            kpanic("ipc: reply word %lu mismatch", i);
         }
     }
 }
 
-static void phase4_run_ipc(void)
+static void ipc_test_run(void)
 {
-    memset(&phase4_ipc, 0, sizeof(phase4_ipc));
+    memset(&ipc_test, 0, sizeof(ipc_test));
 
-    phase4_ipc.client_msg[0] = 0x1122334455667788ULL;
-    phase4_ipc.client_msg[1] = 0x99AABBCCDDEEFF00ULL;
-    phase4_ipc.client_msg[2] = 0x0123456789ABCDEFULL;
-    phase4_ipc.client_msg[3] = 0xFEDCBA9876543210ULL;
+    ipc_test.client_msg[0] = 0x1122334455667788ULL;
+    ipc_test.client_msg[1] = 0x99AABBCCDDEEFF00ULL;
+    ipc_test.client_msg[2] = 0x0123456789ABCDEFULL;
+    ipc_test.client_msg[3] = 0xFEDCBA9876543210ULL;
     for (size_t i = 0; i < 4; i++) {
-        phase4_ipc.reply_expected[i] = ~phase4_ipc.client_msg[i];
+        ipc_test.reply_expected[i] = ~ipc_test.client_msg[i];
     }
 
     task_t *server = task_create();
     task_t *client = task_create();
     if (server == NULL || client == NULL) {
-        kpanic("phase4: task_create failed");
+        kpanic("ipc: task_create failed");
     }
 
     endpoint_t *endpoint = endpoint_create();
     if (endpoint == NULL) {
-        kpanic("phase4: endpoint_create failed");
+        kpanic("ipc: endpoint_create failed");
     }
 
     cap_t server_cap = CAP_NULL;
@@ -1060,83 +1060,83 @@ static void phase4_run_ipc(void)
 
     sys_status_t status;
     status = cap_insert(server->caps, CAP_OBJ_ENDPOINT, endpoint,
-                        CAP_RIGHT_ALL, PHASE4_SERVER_BADGE, &server_cap);
+                        CAP_RIGHT_ALL, IPC_SERVER_BADGE, &server_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: cap_insert failed (%ld)", status);
+        kpanic("ipc: cap_insert failed (%ld)", status);
     }
 
     status = cap_derive(server->caps, server_cap, CAP_RIGHT_ALL,
-                        PHASE4_CLIENT_BADGE, &derived_cap);
+                        IPC_CLIENT_BADGE, &derived_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: cap_derive failed (%ld)", status);
+        kpanic("ipc: cap_derive failed (%ld)", status);
     }
 
     status = cap_grant(server->caps, derived_cap, client->caps, &client_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: cap_grant failed (%ld)", status);
+        kpanic("ipc: cap_grant failed (%ld)", status);
     }
 
     status = cap_delete(server->caps, derived_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: cap_delete failed (%ld)", status);
+        kpanic("ipc: cap_delete failed (%ld)", status);
     }
 
     status = cap_derive(client->caps, client_cap, CAP_RIGHT_READ,
-                        PHASE4_READONLY_BADGE, &readonly_cap);
+                        IPC_READONLY_BADGE, &readonly_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: read-only derivation failed (%ld)", status);
+        kpanic("ipc: read-only derivation failed (%ld)", status);
     }
 
     /* Drop the creator reference without marking the endpoint destroyed; the
      * capability tables now own the object. */
     mk_object_release(&endpoint->header);
 
-    phase4_ipc.client_task = client;
-    phase4_ipc.server_task = server;
-    phase4_ipc.server_cap = server_cap;
-    phase4_ipc.client_cap = client_cap;
-    phase4_ipc.readonly_cap = readonly_cap;
+    ipc_test.client_task = client;
+    ipc_test.server_task = server;
+    ipc_test.server_cap = server_cap;
+    ipc_test.client_cap = client_cap;
+    ipc_test.readonly_cap = readonly_cap;
 
-    phase4_ipc_round(false);
-    phase4_ipc_round(true);
+    ipc_test_round(false);
+    ipc_test_round(true);
 
     void *object = NULL;
     uint64_t badge = 0;
 
     status = cap_lookup(server->caps, server_cap, CAP_OBJ_ENDPOINT,
                         CAP_RIGHT_CALL, &object, &badge);
-    if (status != SYS_OK || badge != PHASE4_SERVER_BADGE) {
-        kpanic("phase4: server badge changed or lookup failed");
+    if (status != SYS_OK || badge != IPC_SERVER_BADGE) {
+        kpanic("ipc: server badge changed or lookup failed");
     }
     status = cap_lookup(client->caps, client_cap, CAP_OBJ_ENDPOINT,
                         CAP_RIGHT_CALL, &object, &badge);
-    if (status != SYS_OK || badge != PHASE4_CLIENT_BADGE) {
-        kpanic("phase4: client badge changed or lookup failed");
+    if (status != SYS_OK || badge != IPC_CLIENT_BADGE) {
+        kpanic("ipc: client badge changed or lookup failed");
     }
     status = cap_lookup(client->caps, readonly_cap, CAP_OBJ_ENDPOINT,
                         CAP_RIGHT_READ, &object, &badge);
-    if (status != SYS_OK || badge != PHASE4_READONLY_BADGE) {
-        kpanic("phase4: read-only badge changed or lookup failed");
+    if (status != SYS_OK || badge != IPC_READONLY_BADGE) {
+        kpanic("ipc: read-only badge changed or lookup failed");
     }
     status = cap_lookup(client->caps, readonly_cap, CAP_OBJ_ENDPOINT,
                         CAP_RIGHT_CALL, &object, &badge);
     if (status != SYS_ERR_CAP_RIGHTS) {
-        kpanic("phase4: read-only cap unexpectedly grants CALL");
+        kpanic("ipc: read-only cap unexpectedly grants CALL");
     }
     status = cap_lookup(client->caps, CAP_NULL, CAP_OBJ_ENDPOINT,
                         0, &object, &badge);
     if (status != SYS_ERR_CAP_INVALID) {
-        kpanic("phase4: CAP_NULL was accepted");
+        kpanic("ipc: CAP_NULL was accepted");
     }
 
     task_destroy(client);
     task_destroy(server);
 
     klog(KLOG_INFO,
-         "phase4: capability rights/badges and cross-task IPC verified (fast+slow)");
+         "ipc: capability rights/badges and cross-task IPC verified (fast+slow)");
 }
 
-typedef struct phase4_notify_ctx {
+typedef struct notify_test_ctx {
     task_t *task;
     cap_t cap;
     notification_t *notification;
@@ -1144,13 +1144,13 @@ typedef struct phase4_notify_ctx {
     uint64_t waiter_bits;
     volatile bool waiter_done;
     volatile bool signaler_done;
-} phase4_notify_ctx_t;
+} notify_test_ctx_t;
 
-static phase4_notify_ctx_t phase4_notify;
+static notify_test_ctx_t notify_test;
 
-static void phase4_notify_waiter_entry(void *arg)
+static void notify_test_waiter_entry(void *arg)
 {
-    phase4_notify_ctx_t *ctx = (phase4_notify_ctx_t *)arg;
+    notify_test_ctx_t *ctx = (notify_test_ctx_t *)arg;
     uint64_t bits = 0;
 
     sys_status_t status = notify_wait(ctx->task, ctx->cap, &bits);
@@ -1160,249 +1160,249 @@ static void phase4_notify_waiter_entry(void *arg)
     thread_exit();
 }
 
-static void phase4_notify_signaler_entry(void *arg)
+static void notify_test_signaler_entry(void *arg)
 {
-    phase4_notify_ctx_t *ctx = (phase4_notify_ctx_t *)arg;
+    notify_test_ctx_t *ctx = (notify_test_ctx_t *)arg;
 
     thread_sleep_ms(20);
-    notify_signal(ctx->notification, PHASE4_NOTIFY_BITS);
+    notify_signal(ctx->notification, NOTIFY_BITS);
     ctx->signaler_done = true;
     thread_exit();
 }
 
-static void phase4_notify_reset(void)
+static void notify_test_reset(void)
 {
-    phase4_notify.waiter_status = SYS_ERR_BUSY;
-    phase4_notify.waiter_bits = 0;
-    phase4_notify.waiter_done = false;
-    phase4_notify.signaler_done = false;
+    notify_test.waiter_status = SYS_ERR_BUSY;
+    notify_test.waiter_bits = 0;
+    notify_test.waiter_done = false;
+    notify_test.signaler_done = false;
 }
 
-static thread_t *phase4_spawn_waiter(void)
+static thread_t *notify_spawn_waiter(void)
 {
-    return thread_create(phase4_notify.task, phase4_notify_waiter_entry,
-                         &phase4_notify);
+    return thread_create(notify_test.task, notify_test_waiter_entry,
+                         &notify_test);
 }
 
-static void phase4_wait_waiter_blocked(thread_t *waiter)
+static void notify_wait_waiter_blocked(thread_t *waiter)
 {
     uint64_t deadline = sched_tick_count() + 500;
 
     while (waiter->state != THREAD_BLOCKED_NOTIFY) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase4: notification waiter did not block");
+            kpanic("notify: notification waiter did not block");
         }
         thread_sleep_ms(1);
     }
 }
 
-static void phase4_wait_for_flag(volatile bool *flag, const char *what)
+static void notify_wait_for_flag(volatile bool *flag, const char *what)
 {
     uint64_t deadline = sched_tick_count() + 500;
 
     while (!*flag) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase4: timeout waiting for %s", what);
+            kpanic("notify: timeout waiting for %s", what);
         }
         thread_sleep_ms(1);
     }
 }
 
-static void phase4_run_notifications(void)
+static void notify_test_run(void)
 {
     task_t *task = task_create();
     if (task == NULL) {
-        kpanic("phase4: notification task_create failed");
+        kpanic("notify: notification task_create failed");
     }
 
     notification_t *notification = notification_create();
     if (notification == NULL) {
-        kpanic("phase4: notification_create failed");
+        kpanic("notify: notification_create failed");
     }
 
     cap_t ntf_cap = CAP_NULL;
     sys_status_t status = cap_insert(task->caps, CAP_OBJ_NOTIFICATION,
                                      notification, CAP_RIGHT_READ, 0, &ntf_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: notification cap_insert failed (%ld)", status);
+        kpanic("notify: notification cap_insert failed (%ld)", status);
     }
     /* Drop the creator reference; the capability table owns the object. */
     mk_object_release(&notification->header);
 
-    memset(&phase4_notify, 0, sizeof(phase4_notify));
-    phase4_notify.task = task;
-    phase4_notify.cap = ntf_cap;
-    phase4_notify.notification = notification;
+    memset(&notify_test, 0, sizeof(notify_test));
+    notify_test.task = task;
+    notify_test.cap = ntf_cap;
+    notify_test.notification = notification;
 
     /* (1) pre-signaled, non-blocking. */
-    phase4_notify_reset();
-    notify_signal(notification, PHASE4_NOTIFY_BITS);
+    notify_test_reset();
+    notify_signal(notification, NOTIFY_BITS);
 
     uint64_t reaped_base = sched_reaped_count();
-    thread_t *waiter = phase4_spawn_waiter();
+    thread_t *waiter = notify_spawn_waiter();
     if (waiter == NULL) {
-        kpanic("phase4: cannot create notification waiter");
+        kpanic("notify: cannot create notification waiter");
     }
-    phase4_wait_for_flag(&phase4_notify.waiter_done, "pre-signaled waiter");
+    notify_wait_for_flag(&notify_test.waiter_done, "pre-signaled waiter");
     wait_for_reaped(reaped_base + 1);
-    if (phase4_notify.waiter_status != SYS_OK ||
-        phase4_notify.waiter_bits != PHASE4_NOTIFY_BITS) {
-        kpanic("phase4: pre-signaled notification mismatch");
+    if (notify_test.waiter_status != SYS_OK ||
+        notify_test.waiter_bits != NOTIFY_BITS) {
+        kpanic("notify: pre-signaled notification mismatch");
     }
 
     /* (2) blocking waiter woken by another thread. */
-    phase4_notify_reset();
+    notify_test_reset();
     reaped_base = sched_reaped_count();
-    waiter = phase4_spawn_waiter();
+    waiter = notify_spawn_waiter();
     if (waiter == NULL) {
-        kpanic("phase4: cannot create notification waiter");
+        kpanic("notify: cannot create notification waiter");
     }
-    phase4_wait_waiter_blocked(waiter);
+    notify_wait_waiter_blocked(waiter);
 
-    thread_t *signaler = thread_create(task, phase4_notify_signaler_entry,
-                                       &phase4_notify);
+    thread_t *signaler = thread_create(task, notify_test_signaler_entry,
+                                       &notify_test);
     if (signaler == NULL) {
-        kpanic("phase4: cannot create notification signaler");
+        kpanic("notify: cannot create notification signaler");
     }
-    phase4_wait_for_flag(&phase4_notify.waiter_done, "thread-woken waiter");
-    phase4_wait_for_flag(&phase4_notify.signaler_done, "notification signaler");
+    notify_wait_for_flag(&notify_test.waiter_done, "thread-woken waiter");
+    notify_wait_for_flag(&notify_test.signaler_done, "notification signaler");
     wait_for_reaped(reaped_base + 2);
-    if (phase4_notify.waiter_status != SYS_OK ||
-        phase4_notify.waiter_bits != PHASE4_NOTIFY_BITS) {
-        kpanic("phase4: thread-woken notification mismatch");
+    if (notify_test.waiter_status != SYS_OK ||
+        notify_test.waiter_bits != NOTIFY_BITS) {
+        kpanic("notify: thread-woken notification mismatch");
     }
 
     /* (3) blocking waiter woken by a software-triggered external IRQ. */
-    status = irq_bind_notification(PHASE4_IRQ_VECTOR, notification,
-                                   PHASE4_IRQ_BIT);
+    status = irq_bind_notification(IPC_IRQ_VECTOR, notification,
+                                   IPC_IRQ_BIT);
     if (status != SYS_OK) {
-        kpanic("phase4: irq_bind_notification failed (%ld)", status);
+        kpanic("notify: irq_bind_notification failed (%ld)", status);
     }
 
     cap_table_t *objects = cap_table_create();
     if (objects == NULL) {
-        kpanic("phase4: cannot create object cap table");
+        kpanic("notify: cannot create object cap table");
     }
 
-    mk_object_t *irq_object = cap_irq_object_create(PHASE4_IRQ_VECTOR);
+    mk_object_t *irq_object = cap_irq_object_create(IPC_IRQ_VECTOR);
     if (irq_object == NULL) {
-        kpanic("phase4: cannot create IRQ capability object");
+        kpanic("notify: cannot create IRQ capability object");
     }
     cap_t irq_cap = CAP_NULL;
     status = cap_insert(objects, CAP_OBJ_IRQ, irq_object, CAP_RIGHT_READ,
                         0, &irq_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: IRQ cap_insert failed (%ld)", status);
+        kpanic("notify: IRQ cap_insert failed (%ld)", status);
     }
     mk_object_release(irq_object);
 
     paddr_t frame = pmm_alloc_frame();
     if (frame == 0) {
-        kpanic("phase4: cannot allocate test frame");
+        kpanic("notify: cannot allocate test frame");
     }
     mk_object_t *frame_object = cap_frame_object_create(frame);
     if (frame_object == NULL) {
-        kpanic("phase4: cannot create frame capability object");
+        kpanic("notify: cannot create frame capability object");
     }
     cap_t frame_cap = CAP_NULL;
     status = cap_insert(objects, CAP_OBJ_FRAME, frame_object, CAP_RIGHT_READ,
                         0, &frame_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: frame cap_insert failed (%ld)", status);
+        kpanic("notify: frame cap_insert failed (%ld)", status);
     }
     mk_object_release(frame_object);
 
     vspace_t *vspace = vspace_create();
     if (vspace == NULL) {
-        kpanic("phase4: cannot create test vspace");
+        kpanic("notify: cannot create test vspace");
     }
     mk_object_t *vspace_object = cap_vspace_object_create(vspace);
     if (vspace_object == NULL) {
-        kpanic("phase4: cannot create vspace capability object");
+        kpanic("notify: cannot create vspace capability object");
     }
     cap_t vspace_cap = CAP_NULL;
     status = cap_insert(objects, CAP_OBJ_VSPACE, vspace_object, CAP_RIGHT_READ,
                         0, &vspace_cap);
     if (status != SYS_OK) {
-        kpanic("phase4: vspace cap_insert failed (%ld)", status);
+        kpanic("notify: vspace cap_insert failed (%ld)", status);
     }
     mk_object_release(vspace_object);
     vspace_destroy(vspace);
 
-    phase4_notify_reset();
+    notify_test_reset();
     reaped_base = sched_reaped_count();
-    waiter = phase4_spawn_waiter();
+    waiter = notify_spawn_waiter();
     if (waiter == NULL) {
-        kpanic("phase4: cannot create IRQ waiter");
+        kpanic("notify: cannot create IRQ waiter");
     }
-    phase4_wait_waiter_blocked(waiter);
+    notify_wait_waiter_blocked(waiter);
 
     __asm__ volatile("int $0x30" : : : "memory");
 
-    phase4_wait_for_flag(&phase4_notify.waiter_done, "IRQ-woken waiter");
+    notify_wait_for_flag(&notify_test.waiter_done, "IRQ-woken waiter");
     wait_for_reaped(reaped_base + 1);
-    if (phase4_notify.waiter_status != SYS_OK ||
-        phase4_notify.waiter_bits != PHASE4_IRQ_BIT) {
-        kpanic("phase4: IRQ notification mismatch");
+    if (notify_test.waiter_status != SYS_OK ||
+        notify_test.waiter_bits != IPC_IRQ_BIT) {
+        kpanic("notify: IRQ notification mismatch");
     }
 
     cap_table_destroy(objects);
     task_destroy(task);
 
     klog(KLOG_INFO,
-         "phase4: notifications (presignaled/thread/IRQ) and object teardown verified");
+         "notify: notifications (presignaled/thread/IRQ) and object teardown verified");
 }
 
-static void run_phase4_tests(void)
+static void run_ipc_tests(void)
 {
     size_t frames_before = pmm_free_frame_count();
 
-    phase4_run_ipc();
-    phase4_run_notifications();
+    ipc_test_run();
+    notify_test_run();
 
     size_t frames_after = pmm_free_frame_count();
     if (frames_after != frames_before) {
-        kpanic("phase4: PMM leak detected (%lu -> %lu free frames)",
+        kpanic("ipc: PMM leak detected (%lu -> %lu free frames)",
                frames_before, frames_after);
     }
     if (mk_object_live_count() != 0) {
-        kpanic("phase4: leaked %lu kernel objects",
+        kpanic("ipc: leaked %lu kernel objects",
                mk_object_live_count());
     }
 
     klog(KLOG_INFO,
-         "phase4: capability/IPC/notification self-tests passed, 0 leaked PMM frames");
+         "ipc: capability/IPC/notification self-tests passed, 0 leaked PMM frames");
 }
 
 /* ------------------------------------------------------------------------- */
-/* Phase 5 Ring 3, syscall ABI, ELF loader and personality hooks              */
+/* Ring 3 execution, syscall ABI, ELF loader and personality hooks */
 /* ------------------------------------------------------------------------- */
 
-#define PHASE5_USER_BADGE        0x5555555555555555ULL
-#define PHASE5_SERVICE_BADGE     0x6666666666666666ULL
-#define PHASE5_PERSONALITY_TEST  0x1234ULL
-#define PHASE5_PERSONALITY_FAULT 0x1001ULL
+#define USER_TEST_BADGE        0x5555555555555555ULL
+#define SERVICE_TEST_BADGE     0x6666666666666666ULL
+#define PERSONALITY_TEST  0x1234ULL
+#define PERSONALITY_FAULT 0x1001ULL
 
-typedef struct phase5_service_ctx {
+typedef struct user_service_ctx {
     task_t *task;
     cap_t cap;
     uint64_t seen_msg[4];
     uint64_t seen_badge;
     sys_status_t status;
     volatile bool done;
-} phase5_service_ctx_t;
+} user_service_ctx_t;
 
-static phase5_service_ctx_t phase5_service;
-static task_t *phase5_user_task;
-static task_t *phase5_fault_task;
-static const struct limine_file *phase5_init_module;
-static const struct limine_file *phase5_fault_module;
-static volatile bool phase5_user_exited;
-static volatile bool phase5_fault_seen;
-static volatile bool phase5_fault_exited;
-static int64_t phase5_user_status;
+static user_service_ctx_t user_service;
+static task_t *user_task;
+static task_t *fault_task;
+static const struct limine_file *init_module;
+static const struct limine_file *fault_module;
+static volatile bool user_exited;
+static volatile bool fault_seen;
+static volatile bool fault_exited;
+static int64_t user_status;
 
-static bool phase5_path_ends_with(const char *path, const char *suffix)
+static bool path_ends_with(const char *path, const char *suffix)
 {
     if (path == NULL) {
         return false;
@@ -1418,7 +1418,7 @@ static bool phase5_path_ends_with(const char *path, const char *suffix)
     return strcmp(path + (path_len - suffix_len), suffix) == 0;
 }
 
-static const struct limine_file *phase5_find_module(const char *suffix)
+static const struct limine_file *find_module(const char *suffix)
 {
     struct limine_module_response *response =
         (struct limine_module_response *)module_request.response;
@@ -1430,7 +1430,7 @@ static const struct limine_file *phase5_find_module(const char *suffix)
     for (uint64_t i = 0; i < response->module_count; i++) {
         struct limine_file *file = response->modules[i];
 
-        if (file != NULL && phase5_path_ends_with(file->path, suffix)) {
+        if (file != NULL && path_ends_with(file->path, suffix)) {
             return file;
         }
     }
@@ -1438,14 +1438,14 @@ static const struct limine_file *phase5_find_module(const char *suffix)
     return NULL;
 }
 
-static void phase5_user_thread_entry(void *arg)
+static void user_thread_entry(void *arg)
 {
     enter_usermode((uint64_t)(uintptr_t)arg, ELF_USER_STACK_TOP);
 }
 
-static void phase5_service_entry(void *arg)
+static void user_service_entry(void *arg)
 {
-    phase5_service_ctx_t *ctx = (phase5_service_ctx_t *)arg;
+    user_service_ctx_t *ctx = (user_service_ctx_t *)arg;
     thread_t *sender = NULL;
     uint64_t badge = 0;
     uint64_t msg[4] = { 0, 0, 0, 0 };
@@ -1468,7 +1468,7 @@ static void phase5_service_entry(void *arg)
     thread_exit();
 }
 
-static task_t *phase5_spawn_user(const struct limine_file *file,
+static task_t *spawn_user(const struct limine_file *file,
                                  endpoint_t *endpoint, task_t **task_slot,
                                  cap_t *user_cap_out, bool with_frame_cap)
 {
@@ -1493,9 +1493,9 @@ static task_t *phase5_spawn_user(const struct limine_file *file,
         cap_t cap = CAP_NULL;
 
         status = cap_insert(task->caps, CAP_OBJ_ENDPOINT, endpoint,
-                            CAP_RIGHT_CALL, PHASE5_USER_BADGE, &cap);
+                            CAP_RIGHT_CALL, USER_TEST_BADGE, &cap);
         if (status != SYS_OK || cap != 1) {
-            klog(KLOG_ERROR, "phase5: user endpoint cap setup failed (handle %lu)",
+            klog(KLOG_ERROR, "exec: user endpoint cap setup failed (handle %lu)",
                  (uint64_t)cap);
             task_destroy(task);
             return NULL;
@@ -1525,7 +1525,7 @@ static task_t *phase5_spawn_user(const struct limine_file *file,
                             CAP_RIGHT_READ | CAP_RIGHT_WRITE, 0,
                             &frame_cap);
         if (status != SYS_OK || frame_cap != 2) {
-            klog(KLOG_ERROR, "phase5: frame cap setup failed (handle %lu)",
+            klog(KLOG_ERROR, "exec: frame cap setup failed (handle %lu)",
                  (uint64_t)frame_cap);
             mk_object_release(frame_object);
             task_destroy(task);
@@ -1538,7 +1538,7 @@ static task_t *phase5_spawn_user(const struct limine_file *file,
     /* Publish the task before its thread can run and fault. */
     *task_slot = task;
 
-    if (thread_create(task, phase5_user_thread_entry,
+    if (thread_create(task, user_thread_entry,
                       (void *)(uintptr_t)entry) == NULL) {
         *task_slot = NULL;
         task_destroy(task);
@@ -1548,171 +1548,171 @@ static task_t *phase5_spawn_user(const struct limine_file *file,
     return task;
 }
 
-static sys_status_t phase5_spawn_fault(void)
+static sys_status_t spawn_fault(void)
 {
-    if (phase5_fault_task != NULL) {
+    if (fault_task != NULL) {
         return SYS_ERR_BUSY;
     }
-    if (phase5_fault_module == NULL) {
+    if (fault_module == NULL) {
         return SYS_ERR_NOSYS;
     }
 
-    task_t *task = phase5_spawn_user(phase5_fault_module, NULL,
-                                     &phase5_fault_task, NULL, false);
+    task_t *task = spawn_user(fault_module, NULL,
+                                     &fault_task, NULL, false);
 
     return task != NULL ? SYS_OK : SYS_ERR_NOMEM;
 }
 
-static void phase5_on_personality(thread_t *caller, syscall_frame_t *frame)
+static void on_personality(thread_t *caller, syscall_frame_t *frame)
 {
     UNUSED(caller);
 
-    if (frame->rax == PHASE5_PERSONALITY_TEST) {
-        klog(KLOG_INFO, "phase5: personality syscall from Ring 3 (args 0x%lx, 0x%lx)",
+    if (frame->rax == PERSONALITY_TEST) {
+        klog(KLOG_INFO, "personality:  syscall from Ring 3 (args 0x%lx, 0x%lx)",
              frame->rdi, frame->rsi);
         frame->rax = frame->rdi + frame->rsi;
         return;
     }
 
-    if (frame->rax == PHASE5_PERSONALITY_FAULT) {
-        frame->rax = (uint64_t)phase5_spawn_fault();
+    if (frame->rax == PERSONALITY_FAULT) {
+        frame->rax = (uint64_t)spawn_fault();
         return;
     }
 
     frame->rax = (uint64_t)SYS_ERR_NOSYS;
 }
 
-static bool phase5_on_user_exception(thread_t *thread, uint64_t vector,
+static bool on_user_exception(thread_t *thread, uint64_t vector,
                                      uint64_t error, uint64_t fault_addr)
 {
-    bool fault_task =
-        (thread != NULL && thread->owner_task == phase5_fault_task);
+    bool is_fault_task =
+        (thread != NULL && thread->owner_task == fault_task);
 
     klog(KLOG_WARN,
-         "phase5: user exception vector=%lu error=0x%lx addr=0x%lx%s",
-         vector, error, fault_addr, fault_task ? " (fault-test task)" : "");
+         "fault: user exception vector=%lu error=0x%lx addr=0x%lx%s",
+         vector, error, fault_addr, is_fault_task ? " (fault-test task)" : "");
 
-    if (fault_task && vector == 14 && fault_addr == 0) {
-        phase5_fault_seen = true;
+    if (is_fault_task && vector == 14 && fault_addr == 0) {
+        fault_seen = true;
     }
 
     return false;
 }
 
-static void phase5_on_task_exit(task_t *task, int64_t exit_status)
+static void on_task_exit(task_t *task, int64_t exit_status)
 {
-    if (task == phase5_fault_task) {
-        phase5_fault_exited = true;
-        klog(KLOG_INFO, "phase5: fault task terminated (status %ld)",
+    if (task == fault_task) {
+        fault_exited = true;
+        klog(KLOG_INFO, "fault: task terminated (status %ld)",
              exit_status);
-    } else if (task == phase5_user_task) {
-        phase5_user_exited = true;
-        phase5_user_status = exit_status;
-        klog(KLOG_INFO, "phase5: Ring 3 init_test exited (status %ld)",
+    } else if (task == user_task) {
+        user_exited = true;
+        user_status = exit_status;
+        klog(KLOG_INFO, "exec: Ring 3 init_test exited (status %ld)",
              exit_status);
     }
 }
 
-static const mk_hooks_t phase5_hooks = {
-    .on_personality_syscall = phase5_on_personality,
-    .on_user_exception = phase5_on_user_exception,
-    .on_task_exit = phase5_on_task_exit,
+static const mk_hooks_t user_hooks = {
+    .on_personality_syscall = on_personality,
+    .on_user_exception = on_user_exception,
+    .on_task_exit = on_task_exit,
 };
 
-static void phase5_run_cycle(void)
+static void run_user_cycle(void)
 {
-    memset(&phase5_service, 0, sizeof(phase5_service));
-    phase5_user_task = NULL;
-    phase5_fault_task = NULL;
-    phase5_user_exited = false;
-    phase5_fault_seen = false;
-    phase5_fault_exited = false;
-    phase5_user_status = -1;
+    memset(&user_service, 0, sizeof(user_service));
+    user_task = NULL;
+    fault_task = NULL;
+    user_exited = false;
+    fault_seen = false;
+    fault_exited = false;
+    user_status = -1;
 
     uint64_t reaped_base = sched_reaped_count();
 
     endpoint_t *endpoint = endpoint_create();
     if (endpoint == NULL) {
-        kpanic("phase5: endpoint_create failed");
+        kpanic("exec: endpoint_create failed");
     }
 
     task_t *service_task = task_create();
     if (service_task == NULL) {
-        kpanic("phase5: service task_create failed");
+        kpanic("exec: service task_create failed");
     }
 
     cap_t service_cap = CAP_NULL;
     if (cap_insert(service_task->caps, CAP_OBJ_ENDPOINT, endpoint,
-                   CAP_RIGHT_READ, PHASE5_SERVICE_BADGE, &service_cap) != SYS_OK) {
-        kpanic("phase5: service cap_insert failed");
+                   CAP_RIGHT_READ, SERVICE_TEST_BADGE, &service_cap) != SYS_OK) {
+        kpanic("exec: service cap_insert failed");
     }
 
-    phase5_service.task = service_task;
-    phase5_service.cap = service_cap;
+    user_service.task = service_task;
+    user_service.cap = service_cap;
 
-    if (thread_create(service_task, phase5_service_entry,
-                      &phase5_service) == NULL) {
-        kpanic("phase5: service thread_create failed");
+    if (thread_create(service_task, user_service_entry,
+                      &user_service) == NULL) {
+        kpanic("exec: service thread_create failed");
     }
 
     cap_t user_cap = CAP_NULL;
-    if (phase5_spawn_user(phase5_init_module, endpoint, &phase5_user_task,
+    if (spawn_user(init_module, endpoint, &user_task,
                           &user_cap, true) == NULL) {
-        kpanic("phase5: user task spawn failed");
+        kpanic("exec: user task spawn failed");
     }
     if (user_cap != 1) {
-        kpanic("phase5: user endpoint cap handle is %lu", (uint64_t)user_cap);
+        kpanic("exec: user endpoint cap handle is %lu", (uint64_t)user_cap);
     }
 
     mk_object_release(&endpoint->header);
 
     uint64_t deadline = sched_tick_count() + 5000;
-    while (!phase5_user_exited) {
+    while (!user_exited) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: user task timed out");
+            kpanic("exec: user task timed out");
         }
         thread_sleep_ms(2);
     }
 
     deadline = sched_tick_count() + 5000;
-    while (!phase5_service.done) {
+    while (!user_service.done) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: service task timed out");
+            kpanic("exec: service task timed out");
         }
         thread_sleep_ms(2);
     }
 
     deadline = sched_tick_count() + 5000;
-    while (phase5_fault_task == NULL) {
+    while (fault_task == NULL) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: fault task was not spawned");
+            kpanic("exec: fault task was not spawned");
         }
         thread_sleep_ms(2);
     }
 
     deadline = sched_tick_count() + 5000;
-    while (!phase5_fault_exited) {
+    while (!fault_exited) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: fault task did not terminate");
+            kpanic("exec: fault task did not terminate");
         }
         thread_sleep_ms(2);
     }
 
     wait_for_reaped(reaped_base + 3);
 
-    if (phase5_user_status != 0) {
-        kpanic("phase5: Ring 3 test exit status %ld",
-               (long)phase5_user_status);
+    if (user_status != 0) {
+        kpanic("exec: Ring 3 test exit status %ld",
+               (long)user_status);
     }
-    if (!phase5_fault_seen) {
-        kpanic("phase5: user exception hook was not invoked");
+    if (!fault_seen) {
+        kpanic("exec: user exception hook was not invoked");
     }
-    if (phase5_service.status != SYS_OK) {
-        kpanic("phase5: service reply failed (%ld)", phase5_service.status);
+    if (user_service.status != SYS_OK) {
+        kpanic("ipc: service reply failed (%ld)", user_service.status);
     }
-    if (phase5_service.seen_badge != PHASE5_USER_BADGE) {
-        kpanic("phase5: service saw badge 0x%016lx",
-               phase5_service.seen_badge);
+    if (user_service.seen_badge != USER_TEST_BADGE) {
+        kpanic("ipc: service saw badge 0x%016lx",
+               user_service.seen_badge);
     }
 
     uint64_t expected_msg[4] = {
@@ -1722,22 +1722,22 @@ static void phase5_run_cycle(void)
         0xFEDCBA9876543210ULL
     };
     for (size_t i = 0; i < 4; i++) {
-        if (phase5_service.seen_msg[i] != expected_msg[i]) {
-            kpanic("phase5: service message word %lu mismatch", i);
+        if (user_service.seen_msg[i] != expected_msg[i]) {
+            kpanic("ipc: service message word %lu mismatch", i);
         }
     }
 
-    task_destroy(phase5_fault_task);
+    task_destroy(fault_task);
     task_destroy(service_task);
-    task_destroy(phase5_user_task);
+    task_destroy(user_task);
 
-    phase5_fault_task = NULL;
-    phase5_user_task = NULL;
-    phase5_service.task = NULL;
-    phase5_service.cap = CAP_NULL;
+    fault_task = NULL;
+    user_task = NULL;
+    user_service.task = NULL;
+    user_service.cap = CAP_NULL;
 }
 
-static void phase5_victim_recv(void *arg)
+static void victim_recv(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1749,7 +1749,7 @@ static void phase5_victim_recv(void *arg)
     thread_exit();
 }
 
-static void phase5_victim_send(void *arg)
+static void victim_send(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1761,7 +1761,7 @@ static void phase5_victim_send(void *arg)
     thread_exit();
 }
 
-static void phase5_victim_notify(void *arg)
+static void victim_notify(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1771,14 +1771,14 @@ static void phase5_victim_notify(void *arg)
     thread_exit();
 }
 
-static void phase5_victim_killer(void *arg)
+static void victim_killer(void *arg)
 {
     UNUSED(arg);
     thread_sleep_ms(50);
     task_terminate();
 }
 
-static void phase5_run_termination_test(void)
+static void run_termination_test(void)
 {
     size_t frames_before = pmm_free_frame_count();
     uint64_t reaped_base = sched_reaped_count();
@@ -1790,7 +1790,7 @@ static void phase5_run_termination_test(void)
 
     if (recv_endpoint == NULL || send_endpoint == NULL ||
         notification == NULL || victim == NULL) {
-        kpanic("phase5: termination test allocation failed");
+        kpanic("term: termination test allocation failed");
     }
 
     cap_t recv_cap = CAP_NULL;
@@ -1803,27 +1803,27 @@ static void phase5_run_termination_test(void)
                    CAP_RIGHT_CALL, 0, &send_cap) != SYS_OK ||
         cap_insert(victim->caps, CAP_OBJ_NOTIFICATION, notification,
                    CAP_RIGHT_READ, 0, &notification_cap) != SYS_OK) {
-        kpanic("phase5: termination test cap_insert failed");
+        kpanic("term: termination test cap_insert failed");
     }
     if (recv_cap != 1 || send_cap != 2 || notification_cap != 3) {
-        kpanic("phase5: termination test cap handles are wrong");
+        kpanic("term: termination test cap handles are wrong");
     }
 
     mk_object_release(&recv_endpoint->header);
     mk_object_release(&send_endpoint->header);
     mk_object_release(&notification->header);
 
-    if (thread_create(victim, phase5_victim_recv, NULL) == NULL ||
-        thread_create(victim, phase5_victim_send, NULL) == NULL ||
-        thread_create(victim, phase5_victim_notify, NULL) == NULL ||
-        thread_create(victim, phase5_victim_killer, NULL) == NULL) {
-        kpanic("phase5: termination test thread_create failed");
+    if (thread_create(victim, victim_recv, NULL) == NULL ||
+        thread_create(victim, victim_send, NULL) == NULL ||
+        thread_create(victim, victim_notify, NULL) == NULL ||
+        thread_create(victim, victim_killer, NULL) == NULL) {
+        kpanic("term: termination test thread_create failed");
     }
 
     uint64_t deadline = sched_tick_count() + 2000;
     while (victim->thread_count != 0) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: victim task did not terminate");
+            kpanic("term: victim task did not terminate");
         }
         thread_sleep_ms(1);
     }
@@ -1832,22 +1832,22 @@ static void phase5_run_termination_test(void)
     task_destroy(victim);
 
     if (pmm_free_frame_count() != frames_before) {
-        kpanic("phase5: termination test frame leak (%lu -> %lu)",
+        kpanic("term: termination test frame leak (%lu -> %lu)",
                frames_before, pmm_free_frame_count());
     }
     if (mk_object_live_count() != 0) {
-        kpanic("phase5: termination test leaked %lu objects",
+        kpanic("term: termination test leaked %lu objects",
                mk_object_live_count());
     }
 
     klog(KLOG_INFO,
-         "phase5: multi-thread termination and wait-queue cleanup verified");
+         "term: multi-thread termination and wait-queue cleanup verified");
 }
 
-static volatile bool phase5_reply_done;
-static sys_status_t phase5_reply_status;
+static volatile bool reply_done;
+static sys_status_t reply_status;
 
-static void phase5_reply_sender(void *arg)
+static void reply_sender(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1861,7 +1861,7 @@ static void phase5_reply_sender(void *arg)
     }
 }
 
-static void phase5_reply_receiver(void *arg)
+static void reply_receiver(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1874,23 +1874,23 @@ static void phase5_reply_receiver(void *arg)
                                     &sender);
     if (status == SYS_OK) {
         thread_sleep_ms(100);
-        phase5_reply_status = ipc_reply(sender, reply);
+        reply_status = ipc_reply(sender, reply);
     } else {
-        phase5_reply_status = status;
+        reply_status = status;
     }
 
-    phase5_reply_done = true;
+    reply_done = true;
     thread_exit();
 }
 
-static void phase5_reply_killer(void *arg)
+static void reply_killer(void *arg)
 {
     UNUSED(arg);
     thread_sleep_ms(60);
     task_terminate();
 }
 
-static void phase5_run_reply_termination_test(void)
+static void run_reply_termination_test(void)
 {
     size_t frames_before = pmm_free_frame_count();
     uint64_t reaped_base = sched_reaped_count();
@@ -1900,7 +1900,7 @@ static void phase5_run_reply_termination_test(void)
     task_t *receiver_task = task_create();
 
     if (endpoint == NULL || sender_task == NULL || receiver_task == NULL) {
-        kpanic("phase5: reply termination allocation failed");
+        kpanic("reply: reply termination allocation failed");
     }
 
     cap_t sender_cap = CAP_NULL;
@@ -1910,57 +1910,57 @@ static void phase5_run_reply_termination_test(void)
                    CAP_RIGHT_CALL, 0, &sender_cap) != SYS_OK ||
         cap_insert(receiver_task->caps, CAP_OBJ_ENDPOINT, endpoint,
                    CAP_RIGHT_READ, 0, &receiver_cap) != SYS_OK) {
-        kpanic("phase5: reply termination cap_insert failed");
+        kpanic("reply: reply termination cap_insert failed");
     }
 
     mk_object_release(&endpoint->header);
 
-    phase5_reply_done = false;
-    phase5_reply_status = SYS_ERR_BUSY;
+    reply_done = false;
+    reply_status = SYS_ERR_BUSY;
 
-    if (thread_create(sender_task, phase5_reply_sender, NULL) == NULL ||
-        thread_create(sender_task, phase5_reply_killer, NULL) == NULL ||
-        thread_create(receiver_task, phase5_reply_receiver, NULL) == NULL) {
-        kpanic("phase5: reply termination thread_create failed");
+    if (thread_create(sender_task, reply_sender, NULL) == NULL ||
+        thread_create(sender_task, reply_killer, NULL) == NULL ||
+        thread_create(receiver_task, reply_receiver, NULL) == NULL) {
+        kpanic("reply: reply termination thread_create failed");
     }
 
     uint64_t deadline = sched_tick_count() + 3000;
-    while (sender_task->thread_count != 0 || !phase5_reply_done) {
+    while (sender_task->thread_count != 0 || !reply_done) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: reply termination timed out");
+            kpanic("reply: reply termination timed out");
         }
         thread_sleep_ms(2);
     }
 
     wait_for_reaped(reaped_base + 3);
 
-    if (phase5_reply_status != SYS_ERR_INVAL) {
-        kpanic("phase5: stale reply was not rejected (%ld)",
-               phase5_reply_status);
+    if (reply_status != SYS_ERR_INVAL) {
+        kpanic("reply: stale reply was not rejected (%ld)",
+               reply_status);
     }
 
     task_destroy(sender_task);
     task_destroy(receiver_task);
 
     if (pmm_free_frame_count() != frames_before) {
-        kpanic("phase5: reply termination frame leak (%lu -> %lu)",
+        kpanic("reply: reply termination frame leak (%lu -> %lu)",
                frames_before, pmm_free_frame_count());
     }
     if (mk_object_live_count() != 0) {
-        kpanic("phase5: reply termination leaked %lu objects",
+        kpanic("reply: reply termination leaked %lu objects",
                mk_object_live_count());
     }
 
     klog(KLOG_INFO,
-         "phase5: blocked-reply termination and stale reply rejection verified");
+         "reply: blocked-reply termination and stale reply rejection verified");
 }
 
-static volatile bool phase5_destroy_recv_done;
-static volatile bool phase5_destroy_notify_done;
-static sys_status_t phase5_destroy_recv_status;
-static sys_status_t phase5_destroy_notify_status;
+static volatile bool destroy_recv_done;
+static volatile bool destroy_notify_done;
+static sys_status_t destroy_recv_status;
+static sys_status_t destroy_notify_status;
 
-static void phase5_destroy_recv(void *arg)
+static void destroy_recv(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
@@ -1968,25 +1968,25 @@ static void phase5_destroy_recv(void *arg)
     uint64_t msg[4] = { 0, 0, 0, 0 };
     uint64_t badge = 0;
 
-    phase5_destroy_recv_status =
+    destroy_recv_status =
         ipc_recv(self->owner_task, (cap_t)1, msg, &badge, &sender);
-    phase5_destroy_recv_done = true;
+    destroy_recv_done = true;
     thread_exit();
 }
 
-static void phase5_destroy_notify(void *arg)
+static void destroy_notify(void *arg)
 {
     UNUSED(arg);
     thread_t *self = sched_current_thread();
     uint64_t bits = 0;
 
-    phase5_destroy_notify_status =
+    destroy_notify_status =
         notify_wait(self->owner_task, (cap_t)2, &bits);
-    phase5_destroy_notify_done = true;
+    destroy_notify_done = true;
     thread_exit();
 }
 
-static void phase5_run_destroy_wake_test(void)
+static void run_destroy_wake_test(void)
 {
     size_t frames_before = pmm_free_frame_count();
     uint64_t reaped_base = sched_reaped_count();
@@ -1996,7 +1996,7 @@ static void phase5_run_destroy_wake_test(void)
     notification_t *notification = notification_create();
 
     if (task == NULL || endpoint == NULL || notification == NULL) {
-        kpanic("phase5: destroy-wake allocation failed");
+        kpanic("destroy: destroy-wake allocation failed");
     }
 
     cap_t endpoint_cap = CAP_NULL;
@@ -2006,26 +2006,26 @@ static void phase5_run_destroy_wake_test(void)
                    CAP_RIGHT_READ, 0, &endpoint_cap) != SYS_OK ||
         cap_insert(task->caps, CAP_OBJ_NOTIFICATION, notification,
                    CAP_RIGHT_READ, 0, &notification_cap) != SYS_OK) {
-        kpanic("phase5: destroy-wake cap_insert failed");
+        kpanic("destroy: destroy-wake cap_insert failed");
     }
 
-    phase5_destroy_recv_done = false;
-    phase5_destroy_notify_done = false;
-    phase5_destroy_recv_status = SYS_ERR_BUSY;
-    phase5_destroy_notify_status = SYS_ERR_BUSY;
+    destroy_recv_done = false;
+    destroy_notify_done = false;
+    destroy_recv_status = SYS_ERR_BUSY;
+    destroy_notify_status = SYS_ERR_BUSY;
 
-    thread_t *receiver = thread_create(task, phase5_destroy_recv, NULL);
-    thread_t *waiter = thread_create(task, phase5_destroy_notify, NULL);
+    thread_t *receiver = thread_create(task, destroy_recv, NULL);
+    thread_t *waiter = thread_create(task, destroy_notify, NULL);
 
     if (receiver == NULL || waiter == NULL) {
-        kpanic("phase5: destroy-wake thread_create failed");
+        kpanic("destroy: destroy-wake thread_create failed");
     }
 
     uint64_t deadline = sched_tick_count() + 500;
     while (receiver->state != THREAD_BLOCKED_RECV ||
            waiter->state != THREAD_BLOCKED_NOTIFY) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: destroy-wake peers did not block");
+            kpanic("destroy: destroy-wake peers did not block");
         }
         thread_sleep_ms(1);
     }
@@ -2034,9 +2034,9 @@ static void phase5_run_destroy_wake_test(void)
     notification_destroy(notification);
 
     deadline = sched_tick_count() + 500;
-    while (!phase5_destroy_recv_done || !phase5_destroy_notify_done) {
+    while (!destroy_recv_done || !destroy_notify_done) {
         if (sched_tick_count() > deadline) {
-            kpanic("phase5: destroy-wake peers did not return");
+            kpanic("destroy: destroy-wake peers did not return");
         }
         thread_sleep_ms(1);
     }
@@ -2044,60 +2044,60 @@ static void phase5_run_destroy_wake_test(void)
     wait_for_reaped(reaped_base + 2);
     task_destroy(task);
 
-    if (phase5_destroy_recv_status != SYS_ERR_DEAD ||
-        phase5_destroy_notify_status != SYS_ERR_DEAD) {
-        kpanic("phase5: destroy-wake peers did not observe SYS_ERR_DEAD");
+    if (destroy_recv_status != SYS_ERR_DEAD ||
+        destroy_notify_status != SYS_ERR_DEAD) {
+        kpanic("destroy: destroy-wake peers did not observe SYS_ERR_DEAD");
     }
     if (pmm_free_frame_count() != frames_before) {
-        kpanic("phase5: destroy-wake frame leak (%lu -> %lu)",
+        kpanic("destroy: destroy-wake frame leak (%lu -> %lu)",
                frames_before, pmm_free_frame_count());
     }
     if (mk_object_live_count() != 0) {
-        kpanic("phase5: destroy-wake leaked %lu objects",
+        kpanic("destroy: destroy-wake leaked %lu objects",
                mk_object_live_count());
     }
 
     klog(KLOG_INFO,
-         "phase5: endpoint/notification destroy woke blocked peers with DEAD");
+         "destroy: endpoint/notification destroy woke blocked peers with DEAD");
 }
 
-static void run_phase5_tests(void)
+static void run_user_tests(void)
 {
-    phase5_init_module = phase5_find_module("init_test.elf");
-    phase5_fault_module = phase5_find_module("fault_test.elf");
+    init_module = find_module("init_test.elf");
+    fault_module = find_module("fault_test.elf");
 
-    if (phase5_init_module == NULL || phase5_fault_module == NULL) {
-        kpanic("phase5: Limine user modules not found");
+    if (init_module == NULL || fault_module == NULL) {
+        kpanic("exec: Limine user modules not found");
     }
 
-    klog(KLOG_INFO, "phase5: modules init=%lu bytes, fault=%lu bytes",
-         (uint64_t)phase5_init_module->size,
-         (uint64_t)phase5_fault_module->size);
+    klog(KLOG_INFO, "exec: modules init=%lu bytes, fault=%lu bytes",
+         (uint64_t)init_module->size,
+         (uint64_t)fault_module->size);
 
-    mk_register_hooks(&phase5_hooks);
+    mk_register_hooks(&user_hooks);
 
-    phase5_run_cycle();
+    run_user_cycle();
     size_t baseline_frames = pmm_free_frame_count();
 
     for (size_t cycle = 0; cycle < 2; cycle++) {
-        phase5_run_cycle();
+        run_user_cycle();
 
         if (pmm_free_frame_count() != baseline_frames) {
-            kpanic("phase5: cycle %lu leaked frames (%lu -> %lu)",
+            kpanic("exec: cycle %lu leaked frames (%lu -> %lu)",
                    cycle + 1, baseline_frames, pmm_free_frame_count());
         }
         if (mk_object_live_count() != 0) {
-            kpanic("phase5: cycle %lu leaked %lu objects",
+            kpanic("exec: cycle %lu leaked %lu objects",
                    cycle + 1, mk_object_live_count());
         }
     }
 
-    phase5_run_termination_test();
-    phase5_run_reply_termination_test();
-    phase5_run_destroy_wake_test();
+    run_termination_test();
+    run_reply_termination_test();
+    run_destroy_wake_test();
 
     klog(KLOG_INFO,
-         "phase5: 3 Ring 3 cycles, ELF loader, IPC and personality hooks verified");
+         "exec: 3 Ring 3 cycles, ELF loader, IPC and personality hooks verified");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -2144,7 +2144,7 @@ static void cow_stress_worker(void *arg)
                             PAGE_SIZE * 4;
 
     for (uint32_t iter = 0; iter < COW_STRESS_ITERS; iter++) {
-        /* ---- Phase 1: build a parent vspace with owned writable pages ---- */
+        /* ---- Step 1: build a parent vspace with owned writable pages ---- */
         vspace_t *parent = vspace_create();
         if (parent == NULL) {
             kpanic("cow stress: vspace_create failed (slot %u)", worker->slot);
@@ -2167,7 +2167,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 2: clone (fork) ---- */
+        /* ---- Step 2: clone (fork) ---- */
         vspace_t *child = vspace_clone(parent);
         if (child == NULL) {
             kpanic("cow stress: vspace_clone failed");
@@ -2186,7 +2186,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 3: resolve CoW on child (simulates child writes) ---- */
+        /* ---- Step 3: resolve CoW on child (simulates child writes) ---- */
         for (uint32_t p = 0; p < COW_STRESS_PAGES; p++) {
             vaddr_t va = slot_base + (vaddr_t)p * PAGE_SIZE;
 
@@ -2204,7 +2204,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 4: resolve CoW on parent (simulates parent writes) ---- */
+        /* ---- Step 4: resolve CoW on parent (simulates parent writes) ---- */
         for (uint32_t p = 0; p < COW_STRESS_PAGES; p++) {
             vaddr_t va = slot_base + (vaddr_t)p * PAGE_SIZE;
 
@@ -2213,7 +2213,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 5: mmap-style anonymous page churn ---- */
+        /* ---- Step 5: mmap-style anonymous page churn ---- */
         for (uint32_t m = 0; m < COW_STRESS_MMAP_PAGES; m++) {
             paddr_t frame = pmm_alloc_frame();
             if (frame == 0) {
@@ -2229,7 +2229,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 6: munmap-style teardown of the anonymous pages ---- */
+        /* ---- Step 6: munmap-style teardown of the anonymous pages ---- */
         for (uint32_t m = 0; m < COW_STRESS_MMAP_PAGES; m++) {
             vaddr_t va = slot_mmap + (vaddr_t)m * PAGE_SIZE;
 
@@ -2238,7 +2238,7 @@ static void cow_stress_worker(void *arg)
             }
         }
 
-        /* ---- Phase 7: destroy both (simulates exit + wait4 reap) ---- */
+        /* ---- Step 7: destroy both (simulates exit + wait4 reap) ---- */
         vspace_destroy(child);
         vspace_destroy(parent);
 
@@ -2431,7 +2431,7 @@ static void self_test_virtio_blk(void)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Stage E: FPU/SSE context, QoS scheduling, capability handoff              */
+/* Scheduling: FPU/SSE context, QoS scheduling, capability handoff */
 /* ------------------------------------------------------------------------- */
 
 /* IEEE-754 binary64 bit pattern of an integer below 2^53, computed with
@@ -3081,7 +3081,7 @@ static void publish_boot_display(void)
          (uint64_t)fb_handle, (uint64_t)info_handle);
 }
 
-static void run_stage_e_tests(void)
+static void run_sched_tests(void)
 {
     run_fpu_smp_test();
     run_qos_aging_test();
@@ -3216,14 +3216,14 @@ static void selftest_entry(void *arg)
 
     klog(KLOG_INFO, "selftest: boot/idle thread uses a guarded kernel stack");
 
-    run_phase4_tests();
-    run_phase5_tests();
+    run_ipc_tests();
+    run_user_tests();
 
     run_stress_test();
     run_smp_stress_test();
     run_cow_stress_test();
     self_test_virtio_blk();
-    run_stage_e_tests();
+    run_sched_tests();
     publish_boot_display();
 
     collect_bsd_boot_modules();
@@ -3257,7 +3257,7 @@ static NORETURN void boot_continuation(void)
     }
 
     lapic_timer_start();
-    klog(KLOG_INFO, "Phase 3 preemptive multitasking initialized");
+    klog(KLOG_INFO, "sched: preemptive multitasking initialized");
     sched_start();
 
     for (;;) {
@@ -3278,7 +3278,7 @@ void kernel_main(void)
      * lock: spin_acquire() records its owner through this_cpu(). */
     cpu_local_bind(0);
 
-    klog(KLOG_INFO, "LucyK x86_64 microkernel - Phase 1 HAL bootstrap");
+    klog(KLOG_INFO, "LucyK x86_64 microkernel - HAL bootstrap");
     klog(KLOG_INFO, "Kernel base: 0x%016lx", (uint64_t)KERNEL_BASE);
 
     if (!LIMINE_BASE_REVISION_SUPPORTED) {
@@ -3306,7 +3306,7 @@ void kernel_main(void)
 
 
     log_memory_map();
-    klog(KLOG_INFO, "Phase 1 HAL initialized");
+    klog(KLOG_INFO, "hal: initialized");
 
     pmm_init(memmap_request.response, hhdm_request.response->offset);
     klog(KLOG_INFO, "PMM initialized: %lu frames managed, %lu free (%lu MiB)",
@@ -3341,7 +3341,7 @@ void kernel_main(void)
     self_test_kalloc();
     self_test_kernel_mapping();
 
-    klog(KLOG_INFO, "Phase 2 memory management initialized");
+    klog(KLOG_INFO, "mm: memory management initialized");
 
     lapic_init();
     pci_init();

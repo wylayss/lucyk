@@ -352,13 +352,13 @@ static void bsd_init_reaper(void *arg)
     if (clean && frames_after == job->frames_before && objects_after == 0 &&
         pipes_after == 0 && regions == 0 && brk_restored) {
         klog(KLOG_INFO,
-             "bsd: Phase 2 acceptance: mmap/brk, getdents, stat/chdir/getcwd, "
+             "bsd: acceptance: mmap/brk, getdents, stat/chdir/getcwd, "
              "pipe/dup2/ioctl/kill verified; 0 leaked PMM frames (%lu free), "
              "0 leaked mk_object handles, 0 live pipes",
              (unsigned long)frames_after);
     } else {
         klog(KLOG_ERROR,
-             "bsd: Phase 2 acceptance failed (clean=%d, frames %lu -> %lu, "
+             "bsd: acceptance failed (clean=%d, frames %lu -> %lu, "
              "objects %lu, pipes %lu, regions %lu, brk_restored=%d)",
              clean ? 1 : 0, (unsigned long)job->frames_before,
              (unsigned long)frames_after, (unsigned long)objects_after,

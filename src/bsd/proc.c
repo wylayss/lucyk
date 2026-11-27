@@ -767,7 +767,7 @@ void bsd_proc_deliver_signals(bsd_proc_t *proc, syscall_frame_t *frame)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Stage C: sigaction, sigprocmask, sigreturn, setpgid, getpgid, arch_prctl  */
+/* Signals: sigaction, sigprocmask, sigreturn, setpgid, getpgid, arch_prctl   */
 /* ------------------------------------------------------------------------- */
 
 sys_status_t bsd_proc_sigaction(bsd_proc_t *proc, uint32_t signo,
@@ -1028,7 +1028,7 @@ sys_status_t bsd_proc_arch_prctl(int32_t code, uint64_t addr,
 }
 
 /* ------------------------------------------------------------------------- */
-/* Phase 3: fork, execve and wait4                                           */
+/* Process creation: fork, execve and wait4                                   */
 /* ------------------------------------------------------------------------- */
 
 #define BSD_EXEC_MAX_IMAGE (16ULL * 1024ULL * 1024ULL)

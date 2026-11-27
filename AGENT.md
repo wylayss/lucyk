@@ -119,19 +119,19 @@ LucyK/
 
 ## 6. Current Project Status
 
-**Kernel Stages A through D are complete and audited.** The kernel builds cleanly with `-Wall -Wextra -Werror` (clang, C11, freestanding) and boots in QEMU with the expected `[INFO]` serial output and no unhandled exceptions or triple faults.
+**The kernel core is complete and audited.** The kernel builds cleanly with `-Wall -Wextra -Werror` (clang, C11, freestanding) and boots in QEMU with the expected `[INFO]` serial output and no unhandled exceptions or triple faults.
 
 Audited capabilities:
 
-- **Stage A — SMP & locking:** ticket spinlocks (`spinlock.c`), per-CPU `GS_BASE`/TSS state, ACPI MADT discovery, INIT-SIPI-SIPI `ap_trampoline.asm` AP bringup, per-CPU LAPIC timers, and a monotonic request/sequence TLB shootdown protocol. Verified up to **4-core SMP** (`run-smp4`).
-- **Stage B — POSIX signals & process groups:** `sigaction`/`sigprocmask`/`sigreturn`, `kill` process-group semantics, foreground process groups (`setpgid`/`getpgid`), and `/dev/console` `Ctrl+C` -> `SIGINT`.
-- **Stage C — TLS & memory protection:** `FS_BASE` thread-local storage via `IA32_FS_BASE` (`arch_prctl`), inherited on `fork()` and zeroed on `execve()`, and `mprotect` with strict `W^X` enforcement.
-- **Stage D — Hardware I/O & writable storage:** PCI configuration scanner, ACPI MADT + IOAPIC external IRQ routing, VirtIO-Blk DMA driver, and a writable `ext2` root filesystem (`mkdir`/`rmdir`/`unlink`, indirect blocks, bitmap guards).
+- **SMP and locking:** ticket spinlocks (`spinlock.c`), per-CPU `GS_BASE`/TSS state, ACPI MADT discovery, INIT-SIPI-SIPI `ap_trampoline.asm` AP bringup, per-CPU LAPIC timers, and a monotonic request/sequence TLB shootdown protocol. Verified up to **4-core SMP** (`run-smp4`).
+- **POSIX signals and process groups:** `sigaction`/`sigprocmask`/`sigreturn`, `kill` process-group semantics, foreground process groups (`setpgid`/`getpgid`), and `/dev/console` `Ctrl+C` -> `SIGINT`.
+- **TLS and memory protection:** `FS_BASE` thread-local storage via `IA32_FS_BASE` (`arch_prctl`), inherited on `fork()` and zeroed on `execve()`, and `mprotect` with strict `W^X` enforcement.
+- **Hardware I/O and writable storage:** PCI configuration scanner, ACPI MADT + IOAPIC external IRQ routing, VirtIO-Blk DMA driver, and a writable `ext2` root filesystem (`mkdir`/`rmdir`/`unlink`, indirect blocks, bitmap guards).
 
 ---
 
 ## 7. Build & Verification Gate
-Before completing any phase or task:
+Before completing any task:
 1. Build cleanly with zero warnings (`-Wall -Wextra -Werror`).
 2. Verify linker alignment (`4096` bytes) in `linker.ld` with distinct `.text` (`RX`), `.rodata` (`R`), and `.data`/`.bss` (`RW`) segments.
 3. Boot `build/os.iso` in QEMU with `-serial stdio -no-reboot -no-shutdown` and confirm expected `[INFO]` serial output with zero unhandled exceptions or triple faults.
@@ -149,7 +149,7 @@ Strict Git repository hygiene applies to every AI coding agent working on `wylay
 
 2. **Verification Gate Before Commit:**
    - Never create a commit until `./scripts/verify.sh` (`make verify`) passes cleanly.
-   - "Cleanly" means: `-Wall -Wextra -Werror` with zero warnings; architectural boundary/hygiene scan; QEMU `-smp 1` and `-cpu max -smp 4` boot checks reaching the `lucyk#` prompt with Stage A–D self-tests and 0 leaked frames; and `e2fsck -fn build/disk.img`.
+   - "Cleanly" means: `-Wall -Wextra -Werror` with zero warnings; architectural boundary/hygiene scan; QEMU `-smp 1` and `-cpu max -smp 4` boot checks reaching the `lucyk#` prompt with the self-tests and 0 leaked frames; and `e2fsck -fn build/disk.img`.
    - A failing or skipped gate blocks the commit; do not commit with a known-red verification.
 
 3. **Atomic Commits & Subsystem Prefixes:**

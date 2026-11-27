@@ -271,7 +271,7 @@ To prevent deadlock, locks are always acquired top-down:
   - `heap_lock` (`kalloc.c`) is released before mapping new chunks so `vspace -> PMM` acquisition happens without the heap lock held.
   - `vspace_lock` (the global page-table lock) serializes all lower-half page-table/PTE mutation and keeps shootdown targets coherent.
   - `pmm_lock` is the innermost core lock.
-  - Stage E core locks: `task_registry_lock` (`task.c`) is taken before `cap_lock` (`cap.c`, guarding every capability table); `qos_lock` (`sched.c`) is a leaf; `irq_binding_lock` (`ipc.c`) is taken before `ioapic_lock`. Object releases always happen after `cap_lock` is dropped.
+  - Core locks: `task_registry_lock` (`task.c`) is taken before `cap_lock` (`cap.c`, guarding every capability table); `qos_lock` (`sched.c`) is a leaf; `irq_binding_lock` (`ipc.c`) is taken before `ioapic_lock`. Object releases always happen after `cap_lock` is dropped.
 
 Fine-grained per-process BSD state (`fd_table`, `mmap_regions`, `brk`, signal masks, `proc_table`) is serialized with `irq_save()`/`irq_restore()`.
 
@@ -318,7 +318,7 @@ External interrupts are routed into **vectors `32..254`** (`IOAPIC_VECTOR_MIN..I
 
 ```text
 /                 root (writable ext2, or read-only initrd USTAR fallback)
-├── bin/          init, sh, echo (from ext2 image in Stage D builds)
+├── bin/          init, sh, echo (from the ext2 image)
 ├── etc/          motd, ...
 ├── dev/          virtual directory node
 │   └── console   COM1-backed character device (fd 0/1/2 for PID 1)
@@ -329,7 +329,7 @@ External interrupts are routed into **vectors `32..254`** (`IOAPIC_VECTOR_MIN..I
 
 `/proc` and `/sys` are mounted by `vfs_mount_introspection()` right after `/dev` (`src/bsd/procfs.c`, see [`BSD_PERSONALITY.md`](BSD_PERSONALITY.md) §5.10); `/sys/bus/pci/devices` reads PCI data only through the read-only `pci_device_snapshot()` helper in `src/include/io/pci.h`.
 
-**Stage F.** `src/io/ahci.c` adds an AHCI 1.0 SATA `blkdev_t`: PCI class `0x01`/subclass `0x06`/`prog_if=0x01`, `PCI_COMMAND_MEMORY|PCI_COMMAND_BUS_MASTER`, `BAR5`(ABAR) `PTE_DEVICE|PTE_NX`, BIOS/OS `BOHC` handoff, `GHC.AE=1`, port scan `PxSSTS.DET==3`+`PxSIG==0x00000101`, DMA-safe 1 KiB `PxCLB`/256 `PxFB`/128-byte command tables + PRDT from contiguous PMM pages, 48-bit LBA `IDENTIFY`(`0xEC`)/`READ DMA EXT`(`0x25`)/`WRITE DMA EXT`(`0x35`) with bounded timeout + bounce buffer; `ahci_init()` called before `bsd_init()`, `blkdev_primary()` falls back to AHCI; `make run-ahci`. `src/io/fbcon.c` 8x16 framebuffer text console (`fbcon_init/putc/write/release`, embedded `font8x16` 0x20-0x7E + fallback, wrap/`\r`/`\n`/`\b`/tab/scroll, RGB masks), mirrors `klog`+`/dev/console` alongside COM1, `SYS_FBCON_RELEASE` + auto-release on boot-framebuffer map. `CAP_FRAME_DMA` (`pmm_alloc_contiguous`/`pmm_free_contiguous`, 256-page cap, `PTE_NX`, no `EXEC`, per-page refcount, never `pmm_free_frame` on device), `CAP_OBJ_HARDWARE`, `pci_claim_bar`, PCI MSI/`0x05`+MSI-X/`0x11`, `ioapic_alloc_msi_vector` `0x50..0x6F`, `SYS_DMA_ALLOC`/`SYS_FRAME_PHYS_ADDR`/`SYS_PCI_CLAIM_BAR`/`SYS_PCI_ALLOC_MSI`.
+**Hardware I/O.** `src/io/ahci.c` adds an AHCI 1.0 SATA `blkdev_t`: PCI class `0x01`/subclass `0x06`/`prog_if=0x01`, `PCI_COMMAND_MEMORY|PCI_COMMAND_BUS_MASTER`, `BAR5`(ABAR) `PTE_DEVICE|PTE_NX`, BIOS/OS `BOHC` handoff, `GHC.AE=1`, port scan `PxSSTS.DET==3`+`PxSIG==0x00000101`, DMA-safe 1 KiB `PxCLB`/256 `PxFB`/128-byte command tables + PRDT from contiguous PMM pages, 48-bit LBA `IDENTIFY`(`0xEC`)/`READ DMA EXT`(`0x25`)/`WRITE DMA EXT`(`0x35`) with bounded timeout + bounce buffer; `ahci_init()` called before `bsd_init()`, `blkdev_primary()` falls back to AHCI; `make run-ahci`. `src/io/fbcon.c` 8x16 framebuffer text console (`fbcon_init/putc/write/release`, embedded `font8x16` 0x20-0x7E + fallback, wrap/`\r`/`\n`/`\b`/tab/scroll, RGB masks), mirrors `klog`+`/dev/console` alongside COM1, `SYS_FBCON_RELEASE` + auto-release on boot-framebuffer map. `CAP_FRAME_DMA` (`pmm_alloc_contiguous`/`pmm_free_contiguous`, 256-page cap, `PTE_NX`, no `EXEC`, per-page refcount, never `pmm_free_frame` on device), `CAP_OBJ_HARDWARE`, `pci_claim_bar`, PCI MSI/`0x05`+MSI-X/`0x11`, `ioapic_alloc_msi_vector` `0x50..0x6F`, `SYS_DMA_ALLOC`/`SYS_FRAME_PHYS_ADDR`/`SYS_PCI_CLAIM_BAR`/`SYS_PCI_ALLOC_MSI`.
 
 `ext2.c` implements direct (12), single-indirect, and double-indirect block mapping over `blkdev_t`, plus a triple-indirect constant reserved for future use. Block and inode allocation walk the group bitmaps and treat superblock/GDT/bitmap/inode-table blocks as reserved (`ext2_block_is_reserved`). An **open-entry table** keeps an inode alive after `unlink()` until the last live vnode reference is released (POSIX unlink-while-open semantics).
 
