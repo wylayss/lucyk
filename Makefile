@@ -71,7 +71,7 @@ C_OBJS   := $(patsubst src/%.c,$(OBJ_DIR)/%.o,$(C_SRCS))
 ASM_OBJS := $(patsubst src/%.asm,$(OBJ_DIR)/%.asm.o,$(ASM_SRCS))
 OBJS     := $(C_OBJS) $(ASM_OBJS)
 
-.PHONY: all clean run run-uefi run-smp1 run-smp4 run-ahci run-net verify limine
+.PHONY: all clean run run-uefi run-smp1 run-smp4 run-ahci run-net run-usb verify limine
 
 all: $(ISO) $(DISK)
 
@@ -90,8 +90,9 @@ $(DISK): $(USER_BSD_INIT) $(USER_BSD_SH) $(USER_BSD_ECHO) Makefile
 		mkdir -p "$(EXT2_ROOT)/sbin/drivers"; \
 		cp -p "$(DRIVERKIT_DIR)/driverd" \
 			"$(EXT2_ROOT)/sbin/drivers/driverd"; \
-		for f in "$(DRIVERKIT_DIR)"/*; do \
+		for f in "$(DRIVERKIT_DIR)"/*d; do \
 			[ -f "$$f" ] || continue; \
+			[ -x "$$f" ] || continue; \
 			[ "$$f" = "$(DRIVERKIT_DIR)/driverd" ] && continue; \
 			cp -p "$$f" "$(EXT2_ROOT)/sbin/drivers/"; \
 		done; \
@@ -240,6 +241,15 @@ run-net: $(ISO) $(DISK)
 		-drive file=$(DISK),if=none,id=hd0,format=raw \
 		-device virtio-blk-pci,drive=hd0 \
 		-netdev user,id=net0 -device e1000,netdev=net0
+
+run-usb: $(ISO) $(DISK)
+	$(QEMU) -M q35 -smp 2 -m 512M -cdrom $(ISO) -serial stdio \
+		-no-reboot -no-shutdown \
+		-drive file=$(DISK),if=none,id=hd0,format=raw \
+		-device virtio-blk-pci,drive=hd0 \
+		-netdev user,id=net0 -device e1000,netdev=net0 \
+		-device qemu-xhci,id=xhci \
+		-device usb-kbd,bus=xhci.0 -device usb-mouse,bus=xhci.0
 
 run-ahci: $(ISO) $(DISK)
 	$(QEMU) -M q35 -m 512M -cdrom $(ISO) -serial stdio -no-reboot -no-shutdown \
