@@ -8,6 +8,8 @@
 #define SYS_ERR_CAP_INVALID_USER (-3)
 #define SYS_ERR_CAP_RIGHTS_USER (-4)
 #define SYS_CAP_RIGHT_READ      0x1ULL
+#define SYS_CAP_RIGHT_WRITE     0x2ULL
+#define SYS_CAP_RIGHT_GRANT     0x8ULL
 #define SYS_CAP_RIGHT_ALL       0xFULL
 #define PAGE_BYTES              4096ULL
 
@@ -2371,11 +2373,54 @@ static size_t append_u64(char *buf, size_t pos, size_t cap, uint64_t value)
     return pos;
 }
 
+/* Probe the boot framebuffer and display-info frames without consuming them.
+ * Both are device/shared CAP_OBJ_FRAME objects installed by the kernel, so a
+ * successful read-only map proves the handles are still valid; the discovery
+ * is immediately unmapped. Returns nonzero when both frames are usable. */
+static int boot_display_frames(uint64_t *framebuffer_bytes)
+{
+    native_result_t info_map = native_call(SYS_VSPACE_MAP,
+                                           DISPLAY_BOOT_CAP_INFO,
+                                           STAGE_E_INFO_VA, 0, 0, 0);
+
+    if (info_map.status != 0) {
+        return 0;
+    }
+
+    const display_info_t *info =
+        (const display_info_t *)(uintptr_t)STAGE_E_INFO_VA;
+    uint64_t mapped = info->mapped_bytes;
+    int valid = info->magic == DISPLAY_INFO_MAGIC &&
+                info->version == DISPLAY_INFO_VERSION && info->width != 0 &&
+                info->height != 0 && info->bpp != 0 &&
+                info->pitch >= info->width * (info->bpp / 8U) &&
+                info->mapped_bytes >= info->size_bytes &&
+                info->mapped_bytes % PAGE_BYTES == 0;
+
+    if (!valid) {
+        (void)native_call(SYS_VSPACE_UNMAP, STAGE_E_INFO_VA, PAGE_BYTES, 0, 0,
+                          0);
+        return 0;
+    }
+
+    native_result_t fb_map =
+        native_call(SYS_VSPACE_MAP, DISPLAY_BOOT_CAP_FRAMEBUFFER, STAGE_E_FB_VA,
+                    0, 0, 0);
+    (void)native_call(SYS_VSPACE_UNMAP, STAGE_E_INFO_VA, PAGE_BYTES, 0, 0, 0);
+
+    if (fb_map.status != 0) {
+        return 0;
+    }
+    (void)native_call(SYS_VSPACE_UNMAP, STAGE_E_FB_VA, mapped, 0, 0, 0);
+    *framebuffer_bytes = mapped;
+    return 1;
+}
+
 /* If /sbin/drivers/driverd exists on /, fork a non-blocking child, query its
- * microkernel task id (SYS_TASK_ID), grant the boot CAP_OBJ_HARDWARE into the
- * child (SYS_CAP_GRANT, destination handle in rdx), then execve driverd in
- * the child with LUCY_HW_CAP=<slot> in envp. init does not wait; the
- * interactive shell starts alongside driverd. */
+ * microkernel task id (SYS_TASK_ID), grant the boot CAP_OBJ_HARDWARE and the
+ * display frames into the child (SYS_CAP_GRANT, destination handles in rdx),
+ * then execve driverd with LUCY_HW_CAP/LUCY_FB_CAP/LUCY_FB_INFO_CAP in envp.
+ * init does not wait; the interactive shell starts alongside driverd. */
 static void launch_driverd(void)
 {
     int64_t probe = bsd_open(DRIVERD_PATH, BSD_O_RDONLY, 0);
@@ -2421,31 +2466,63 @@ static void launch_driverd(void)
         (void)bsd_close(to_child[1]);
 
         uint64_t child_task = native_call(SYS_TASK_ID, 0, 0, 0, 0, 0).rdx;
-        uint64_t slot = 0;
+        uint64_t slots[3] = { 0, 0, 0 };
 
         if (bsd_write(to_parent[1], &child_task, sizeof(child_task)) !=
                 (int64_t)sizeof(child_task) ||
-            bsd_read(to_child[0], &slot, sizeof(slot)) !=
-                (int64_t)sizeof(slot)) {
+            bsd_read(to_child[0], slots, sizeof(slots)) !=
+                (int64_t)sizeof(slots)) {
             user_exit(126);
         }
         (void)bsd_close(to_parent[1]);
         (void)bsd_close(to_child[0]);
 
-        char envbuf[64];
+        char envbuf[192];
         size_t n = 0;
+        size_t starts[3] = { 0, 0, 0 };
 
-        n = append_str(envbuf, n, sizeof(envbuf), "LUCY_HW_CAP=");
-        n = append_u64(envbuf, n, sizeof(envbuf), slot);
-        envbuf[n < sizeof(envbuf) ? n : sizeof(envbuf) - 1] = '\0';
+        if (slots[0] != 0) {
+            starts[0] = n;
+            n = append_str(envbuf, n, sizeof(envbuf), "LUCY_HW_CAP=");
+            n = append_u64(envbuf, n, sizeof(envbuf), slots[0]);
+            if (n < sizeof(envbuf)) {
+                envbuf[n++] = '\0';
+            }
+        }
+        if (slots[1] != 0) {
+            starts[1] = n;
+            n = append_str(envbuf, n, sizeof(envbuf), "LUCY_FB_CAP=");
+            n = append_u64(envbuf, n, sizeof(envbuf), slots[1]);
+            if (n < sizeof(envbuf)) {
+                envbuf[n++] = '\0';
+            }
+        }
+        if (slots[2] != 0) {
+            starts[2] = n;
+            n = append_str(envbuf, n, sizeof(envbuf), "LUCY_FB_INFO_CAP=");
+            n = append_u64(envbuf, n, sizeof(envbuf), slots[2]);
+            if (n < sizeof(envbuf)) {
+                envbuf[n++] = '\0';
+            }
+        }
+        envbuf[sizeof(envbuf) - 1] = '\0';
 
         char *argv[2];
-        char *envp[2];
+        char *envp[4];
+        size_t envn = 0;
 
         argv[0] = "driverd";
         argv[1] = NULL;
-        envp[0] = envbuf;
-        envp[1] = NULL;
+        if (slots[0] != 0) {
+            envp[envn++] = envbuf + starts[0];
+        }
+        if (slots[1] != 0) {
+            envp[envn++] = envbuf + starts[1];
+        }
+        if (slots[2] != 0) {
+            envp[envn++] = envbuf + starts[2];
+        }
+        envp[envn] = NULL;
 
         (void)bsd_execve(DRIVERD_PATH, argv, envp);
         write_text(1, "init: cannot exec " DRIVERD_PATH "\n");
@@ -2457,7 +2534,9 @@ static void launch_driverd(void)
     (void)bsd_close(to_child[0]);
 
     uint64_t child_task = 0;
-    uint64_t slot = 0;
+    uint64_t slots[3] = { 0, 0, 0 };
+    uint64_t framebuffer_bytes = 0;
+    int display_ok = boot_display_frames(&framebuffer_bytes);
 
     if (bsd_read(to_parent[0], &child_task, sizeof(child_task)) ==
             (int64_t)sizeof(child_task) &&
@@ -2467,12 +2546,38 @@ static void launch_driverd(void)
                         0, 0);
 
         if (grant.status == 0) {
-            slot = grant.rdx; /* destination handle in the child, rdx */
+            slots[0] = grant.rdx; /* destination handle in the child, rdx */
         } else {
             write_text(1, "init: SYS_CAP_GRANT hardware to driverd failed\n");
         }
+
+        if (display_ok) {
+            native_result_t fb_grant =
+                native_call(SYS_CAP_GRANT, DISPLAY_BOOT_CAP_FRAMEBUFFER,
+                            child_task,
+                            SYS_CAP_RIGHT_READ | SYS_CAP_RIGHT_WRITE |
+                                SYS_CAP_RIGHT_GRANT,
+                            0, 0);
+            native_result_t info_grant =
+                native_call(SYS_CAP_GRANT, DISPLAY_BOOT_CAP_INFO, child_task,
+                            SYS_CAP_RIGHT_READ | SYS_CAP_RIGHT_GRANT, 0, 0);
+
+            if (fb_grant.status == 0) {
+                slots[1] = fb_grant.rdx;
+            }
+            if (info_grant.status == 0) {
+                slots[2] = info_grant.rdx;
+            }
+            if (slots[1] != 0 && slots[2] != 0) {
+                write_text(1, "init: granted ");
+                write_unsigned(1, framebuffer_bytes);
+                write_text(1, " framebuffer bytes to driverd\n");
+            } else {
+                write_text(1, "init: display frame grant to driverd failed\n");
+            }
+        }
     }
-    (void)bsd_write(to_child[1], &slot, sizeof(slot));
+    (void)bsd_write(to_child[1], slots, sizeof(slots));
     (void)bsd_close(to_parent[0]);
     (void)bsd_close(to_child[1]);
 
