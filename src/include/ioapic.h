@@ -43,3 +43,6 @@ bool ioapic_resolve_irq(uint8_t irq, uint8_t *gsi_out, bool *active_low_out,
                         bool *level_triggered_out);
 
 #endif /* LUCYK_IOAPIC_H */
+/* Allocates an unused dynamic LAPIC vector 0x50..0x6F, or 0. */
+uint8_t ioapic_alloc_msi_vector(void);
+void ioapic_free_msi_vector(uint8_t vector);

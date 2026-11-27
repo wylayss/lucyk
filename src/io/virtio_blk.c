@@ -1,6 +1,7 @@
 #include <idt.h>
 #include <io.h>
 #include <io/blkdev.h>
+#include <io/ahci.h>
 #include <io/pci.h>
 #include <ioapic.h>
 #include <isr.h>
@@ -211,6 +212,8 @@ bool blk_init(void)
     blk.irq_pin = dev->interrupt_pin;
 
     pci_enable_bus_master(dev);
+    /* Kernel owns this storage controller; block Ring 3 SYS_PCI_*. */
+    pci_kernel_claim(dev->bus, dev->slot, dev->func);
 
     vp_write8(VIRTIO_PCI_STATUS, 0);
     if (!blk_wait_reset()) {
@@ -536,10 +539,11 @@ static blkdev_t virtio_blkdev = {
 
 blkdev_t *blkdev_primary(void)
 {
-    if (!blk.present) {
-        return NULL;
+    if (blk.present) {
+        virtio_blkdev.capacity_sectors = blk.capacity;
+        return &virtio_blkdev;
     }
 
-    virtio_blkdev.capacity_sectors = blk.capacity;
-    return &virtio_blkdev;
+    /* AHCI SATA fallback. */
+    return ahci_blkdev_primary();
 }

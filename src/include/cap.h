@@ -18,7 +18,8 @@ typedef enum cap_obj_type {
     CAP_OBJ_NOTIFICATION,
     CAP_OBJ_VSPACE,
     CAP_OBJ_IRQ,
-    CAP_OBJ_FRAME
+    CAP_OBJ_FRAME,
+    CAP_OBJ_HARDWARE /* Privileged hardware-control authority */
 } cap_obj_type_t;
 
 #define CAP_RIGHT_READ  (1ULL << 0)
@@ -100,11 +101,15 @@ typedef struct cap_vspace_object {
  *  - DEVICE: a page-aligned physical range outside PMM management (MMIO, a
  *            linear framebuffer). Mapped non-executable with device cache
  *            attributes, never reference counted and never freed: unmapping
- *            or deleting the capability leaves the hardware range alone. */
+ *            or deleting the capability leaves the hardware range alone.
+ *  - DMA:    contiguous PMM-managed pages reserved for device DMA. Mapped
+ *            non-executable; every page is PMM reference counted and released
+ *            when the capability and all mappings go. */
 typedef enum cap_frame_kind {
     CAP_FRAME_ANON = 0,
     CAP_FRAME_SHARED,
-    CAP_FRAME_DEVICE
+    CAP_FRAME_DEVICE,
+    CAP_FRAME_DMA
 } cap_frame_kind_t;
 
 typedef struct cap_frame_object {
@@ -117,6 +122,9 @@ typedef struct cap_frame_object {
 } cap_frame_object_t;
 
 mk_object_t *cap_vspace_object_create(vspace_t *vspace);
+
+/* Kernel-minted privileged hardware-control authority. */
+mk_object_t *cap_hardware_object_create(void);
 mk_object_t *cap_frame_object_create(paddr_t phys);
 
 /* The object takes over the caller's PMM reference on phys. */
@@ -126,6 +134,11 @@ mk_object_t *cap_shared_frame_object_create(paddr_t phys);
  * The PMM is never consulted for these frames. */
 mk_object_t *cap_device_frame_object_create(paddr_t phys, size_t page_count,
                                             bool write_combining);
+
+/* Wraps page_count contiguous PMM pages at page-aligned phys as a
+ * CAP_FRAME_DMA object. The object holds one PMM reference on the run;
+ * mapping takes additional per-page references. Never executable. */
+mk_object_t *cap_dma_frame_object_create(paddr_t phys, size_t page_count);
 
 /* Maps every page of a frame object at vaddr in vs according to its kind.
  * prot is VSPACE_PROT_WRITE and/or VSPACE_PROT_EXEC; device frames reject

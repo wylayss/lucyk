@@ -1,4 +1,6 @@
 #include <acpi.h>
+#include <idt.h>
+#include <lapic.h>
 #include <io.h>
 #include <ioapic.h>
 #include <klog.h>
@@ -29,6 +31,7 @@ typedef struct ioapic_unit {
 static ioapic_unit_t ioapic_units[ACPI_MAX_IOAPICS];
 static uint32_t ioapic_total;
 static spinlock_t ioapic_lock;
+static spinlock_t msi_lock;
 
 /* GSIs currently routed, by a kernel driver or a capability. Guarded by
  * ioapic_lock. */
@@ -106,6 +109,7 @@ static ioapic_unit_t *ioapic_for_gsi(uint8_t gsi)
 void ioapic_init(void)
 {
     spinlock_init(&ioapic_lock);
+    spinlock_init(&msi_lock);
     memset(ioapic_units, 0, sizeof(ioapic_units));
     memset(ioapic_gsi_claimed, 0, sizeof(ioapic_gsi_claimed));
     ioapic_total = 0;
@@ -369,4 +373,39 @@ bool ioapic_resolve_irq(uint8_t irq, uint8_t *gsi_out, bool *active_low_out,
     *active_low_out = irq >= 16U;
     *level_triggered_out = irq >= 16U;
     return true;
+}
+
+#define MSI_VECTOR_FIRST 0x50U
+#define MSI_VECTOR_LAST  0x6FU
+
+static uint32_t msi_vectors_used;
+
+/* Allocates an unused dynamic LAPIC vector 0x50..0x6F for PCI MSI/MSI-X. */
+uint8_t ioapic_alloc_msi_vector(void)
+{
+    uint8_t vector = 0;
+    uint64_t flags = spin_lock_irqsave(&msi_lock);
+
+    for (uint32_t v = MSI_VECTOR_FIRST; v <= MSI_VECTOR_LAST; v++) {
+        uint32_t bit = 1U << (v - MSI_VECTOR_FIRST);
+        if ((msi_vectors_used & bit) == 0) {
+            msi_vectors_used |= bit;
+            vector = (uint8_t)v;
+            break;
+        }
+    }
+
+    spin_unlock_irqrestore(&msi_lock, flags);
+    return vector;
+}
+
+void ioapic_free_msi_vector(uint8_t vector)
+{
+    if (vector < MSI_VECTOR_FIRST || vector > MSI_VECTOR_LAST) {
+        return;
+    }
+
+    uint64_t flags = spin_lock_irqsave(&msi_lock);
+    msi_vectors_used &= ~(1U << (vector - MSI_VECTOR_FIRST));
+    spin_unlock_irqrestore(&msi_lock, flags);
 }

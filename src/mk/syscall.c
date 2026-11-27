@@ -1,5 +1,11 @@
 #include <cap.h>
 #include <io.h>
+#include <io/fbcon.h>
+#include <io/pci.h>
+#include <ioapic.h>
+#include <lapic.h>
+#include <idt.h>
+#include <ipc.h>
 #include <ipc.h>
 #include <klog.h>
 #include <mk_hooks.h>
@@ -8,6 +14,8 @@
 #include <string.h>
 #include <syscall.h>
 #include <syscall_numbers.h>
+#include <display.h>
+#include <pmm.h>
 #include <task.h>
 #include <types.h>
 #include <vspace.h>
@@ -106,8 +114,17 @@ static void dispatch_frame_map(task_t *task, syscall_frame_t *frame)
 
     cap_frame_object_t *frame_object = (cap_frame_object_t *)object;
 
+    bool is_device = frame_object->kind == CAP_FRAME_DEVICE;
     status = cap_frame_map(frame_object, task->vspace, vaddr, prot);
     mk_object_release(&frame_object->header);
+
+    /* Handover: a Ring 3 caller taking the boot framebuffer stops kernel
+     * framebuffer drawing atomically to avoid tearing. */
+    if (status == SYS_OK && (cap_t)frame->rdi == DISPLAY_BOOT_CAP_FRAMEBUFFER &&
+        is_device) {
+        fbcon_release();
+    }
+
     frame->rax = status;
 }
 
@@ -276,6 +293,274 @@ static void dispatch_range_unmap(task_t *task, syscall_frame_t *frame)
     frame->rax = status;
 }
 
+/* SYS_DMA_ALLOC(page_count, rights): contiguous PMM pages as CAP_FRAME_DMA,
+ * zeroed, page-capped, never executable. Handle in rdx. */
+static void dispatch_dma_alloc(task_t *task, syscall_frame_t *frame)
+{
+    uint64_t page_count = frame->rdi;
+    uint64_t rights = frame->rsi;
+
+    if (page_count == 0 || page_count > SYS_DMA_ALLOC_MAX_PAGES ||
+        (rights & ~CAP_RIGHT_ALL) != 0 ||
+        (rights & (CAP_RIGHT_READ | CAP_RIGHT_WRITE)) == 0) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    uint64_t phys = pmm_alloc_contiguous((size_t)page_count);
+    if (phys == 0) {
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    mk_object_t *object = cap_dma_frame_object_create(phys, (size_t)page_count);
+    if (object == NULL) {
+        pmm_free_contiguous((uintptr_t)phys, (size_t)page_count);
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    cap_t cap = CAP_NULL;
+    sys_status_t status = cap_insert(task->caps, CAP_OBJ_FRAME, object,
+                                     rights & CAP_RIGHT_ALL, 0, &cap);
+    mk_object_release(object);
+
+    if (status != SYS_OK) {
+        frame->rax = status;
+        return;
+    }
+
+    frame->rax = SYS_OK;
+    frame->rdx = (uint64_t)cap;
+}
+
+/* SYS_FRAME_PHYS_ADDR(frame_cap): physical base only for CAP_FRAME_DMA. */
+static void dispatch_frame_phys_addr(task_t *task, syscall_frame_t *frame)
+{
+    void *object = NULL;
+    sys_status_t status = cap_lookup_retained(task->caps, (cap_t)frame->rdi,
+                                              CAP_OBJ_FRAME, CAP_RIGHT_READ,
+                                              &object, NULL);
+    if (status != SYS_OK) {
+        frame->rax = status;
+        return;
+    }
+
+    cap_frame_object_t *frame_object = (cap_frame_object_t *)object;
+
+    if (frame_object->kind != CAP_FRAME_DMA) {
+        mk_object_release(&frame_object->header);
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    frame->rax = SYS_OK;
+    frame->rdx = (uint64_t)frame_object->phys;
+    mk_object_release(&frame_object->header);
+}
+
+/* SYS_PCI_CLAIM_BAR(bdf, bar_index): privileged. Validates MMIO BAR, marks
+ * claimed, enables memory+bus-master, returns CAP_FRAME_DEVICE (PAGE-rounded)
+ * in rdx and sub-page byte offset in r8. bdf = (bus<<16)|(slot<<8)|func. */
+static void dispatch_pci_claim_bar(task_t *task, syscall_frame_t *frame)
+{
+    /* Privileged hardware manager: hold a CAP_OBJ_HARDWARE authority. */
+    void *hw = NULL;
+    if (task == NULL ||
+        cap_lookup_retained(task->caps, 1U, CAP_OBJ_HARDWARE, CAP_RIGHT_WRITE,
+                            &hw, NULL) != SYS_OK) {
+        /* No privileged hardware capability in slot 1. */
+        bool allowed = false;
+        for (cap_t slot = 1; slot <= CAP_TABLE_SLOTS; slot++) {
+            if (cap_lookup_retained(task->caps, slot, CAP_OBJ_HARDWARE,
+                                    CAP_RIGHT_WRITE, &hw, NULL) == SYS_OK) {
+                mk_object_release((mk_object_t *)hw);
+                allowed = true;
+                break;
+            }
+        }
+        if (!allowed) {
+            frame->rax = SYS_ERR_CAP_RIGHTS;
+            return;
+        }
+    } else {
+        mk_object_release((mk_object_t *)hw);
+    }
+
+    uint64_t bdf = frame->rdi;
+    uint64_t bar_index = frame->rsi;
+    uint32_t bus = (uint32_t)((bdf >> 16) & 0xFFU);
+    uint32_t slot = (uint32_t)((bdf >> 8) & 0xFFU);
+    uint32_t func = (uint32_t)(bdf & 0xFFU);
+
+    if (bar_index >= PCI_BAR_COUNT) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    /* Locate the enumerated function. */
+    pci_device_t dev;
+    bool found = false;
+    size_t n = pci_device_count();
+    for (size_t i = 0; i < n; i++) {
+        if (pci_device_snapshot(i, &dev) && dev.bus == bus &&
+            dev.slot == slot && dev.func == func) {
+            found = true;
+            break;
+        }
+    }
+
+    if (!found || dev.bar_io[bar_index]) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    /* Reject I/O-space BARs (bit0==1 handled by bar_io), a reserved second
+     * half of a 64-bit BAR, and claiming bar_index+1 independently. */
+    if (dev.bar64[bar_index] == true && bar_index >= PCI_BAR_COUNT) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+    if (bar_index + 1U < PCI_BAR_COUNT && dev.bar64[bar_index + 1U]) {
+        /* bar_index+1 is the reserved high dword of a 64-bit BAR at
+         * bar_index; it cannot be claimed on its own. */
+    }
+
+    uint64_t bar = dev.bar[bar_index];
+    uint64_t bar_size = dev.bar_size[bar_index];
+
+    if (bar == 0 || bar_size == 0) {
+        frame->rax = SYS_ERR_INVAL;
+        return;
+    }
+
+    if (pci_is_kernel_claimed((uint8_t)bus, (uint8_t)slot, (uint8_t)func)) {
+        frame->rax = SYS_ERR_BUSY;
+        return;
+    }
+
+    if (pci_claim_bar((uint8_t)bus, (uint8_t)slot, (uint8_t)func,
+                      (uint32_t)bar_index) != SYS_OK) {
+        frame->rax = SYS_ERR_BUSY;
+        return;
+    }
+
+    /* Enable memory space + bus mastering. */
+    pci_enable_bus_master(&dev);
+
+    uint64_t phys = bar;
+    uint64_t offset = phys & 0xFFFULL;
+    uint64_t base = phys & ~0xFFFULL;
+    uint64_t span = ((offset + bar_size) + 0xFFFULL) & ~0xFFFULL;
+
+    mk_object_t *object = cap_device_frame_object_create(
+        (paddr_t)base, (size_t)(span / 4096ULL), false);
+    if (object == NULL) {
+        pci_release_bar((uint8_t)bus, (uint8_t)slot, (uint8_t)func, (uint32_t)bar_index);
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    cap_t cap = CAP_NULL;
+    sys_status_t status = cap_insert(task->caps, CAP_OBJ_FRAME, object,
+                                     CAP_RIGHT_READ | CAP_RIGHT_WRITE, 0, &cap);
+    mk_object_release(object);
+
+    if (status != SYS_OK) {
+        pci_release_bar((uint8_t)bus, (uint8_t)slot, (uint8_t)func, (uint32_t)bar_index);
+        frame->rax = status;
+        return;
+    }
+
+    frame->rax = SYS_OK;
+    frame->rdx = (uint64_t)cap;
+    frame->r8 = offset;
+}
+
+/* SYS_PCI_ALLOC_MSI(bdf, irq_cap): privileged. Allocates a dynamic LAPIC
+ * vector 0x50..0x6F, programs PCI MSI/MSI-X to the BSP, binds the vector to
+ * irq_cap (CAP_OBJ_IRQ). */
+static void dispatch_pci_alloc_msi(task_t *task, syscall_frame_t *frame)
+{
+    /* Privileged hardware manager. */
+    void *hw = NULL;
+    bool allowed = false;
+    if (task != NULL) {
+        for (cap_t slot = 1; slot <= CAP_TABLE_SLOTS; slot++) {
+            if (cap_lookup_retained(task->caps, slot, CAP_OBJ_HARDWARE,
+                                    CAP_RIGHT_WRITE, &hw, NULL) == SYS_OK) {
+                mk_object_release((mk_object_t *)hw);
+                allowed = true;
+                break;
+            }
+        }
+    }
+    if (!allowed) {
+        frame->rax = SYS_ERR_CAP_RIGHTS;
+        return;
+    }
+
+    uint64_t bdf = frame->rdi;
+    uint32_t bus = (uint32_t)((bdf >> 16) & 0xFFU);
+    uint32_t slot = (uint32_t)((bdf >> 8) & 0xFFU);
+    uint32_t func = (uint32_t)(bdf & 0xFFU);
+
+    void *irq_object = NULL;
+    sys_status_t status = cap_lookup_retained(task->caps, (cap_t)frame->rsi,
+                                              CAP_OBJ_IRQ, CAP_RIGHT_WRITE,
+                                              &irq_object, NULL);
+    if (status != SYS_OK) {
+        frame->rax = status;
+        return;
+    }
+
+    cap_irq_object_t *irq = (cap_irq_object_t *)irq_object;
+
+    uint8_t vector = ioapic_alloc_msi_vector();
+    if (vector == 0) {
+        mk_object_release(irq_object);
+        frame->rax = SYS_ERR_NOMEM;
+        return;
+    }
+
+    /* Refuse to reprogram a Ring 0 kernel storage controller. */
+    if (pci_is_kernel_claimed((uint8_t)bus, (uint8_t)slot, (uint8_t)func)) {
+        ioapic_free_msi_vector(vector);
+        mk_object_release(irq_object);
+        frame->rax = SYS_ERR_BUSY;
+        return;
+    }
+
+    uint32_t apic = lapic_id();
+    status = pci_msi_configure((uint8_t)bus, (uint8_t)slot, (uint8_t)func,
+                               vector, apic);
+    if (status != SYS_OK) {
+        ioapic_free_msi_vector(vector);
+        mk_object_release(irq_object);
+        frame->rax = status;
+        return;
+    }
+
+    irq->vector = vector;
+    irq->gsi_backed = false;
+    irq->msi = true;
+    irq->msi_bdf = ((uint32_t)bus << 16) | ((uint32_t)slot << 8) | func;
+
+    /* Ensure memory + bus master. */
+    pci_device_t dev;
+    for (size_t i = 0; i < pci_device_count(); i++) {
+        if (pci_device_snapshot(i, &dev) && dev.bus == bus &&
+            dev.slot == slot && dev.func == func) {
+            pci_enable_bus_master(&dev);
+            break;
+        }
+    }
+
+    mk_object_release(irq_object);
+    frame->rax = SYS_OK;
+    frame->rdx = vector;
+}
+
 static void dispatch_debug_log(syscall_frame_t *frame)
 {
     size_t len = (size_t)frame->rsi;
@@ -440,6 +725,27 @@ void syscall_dispatch(syscall_frame_t *frame)
 
     case SYS_DEBUG_LOG:
         dispatch_debug_log(frame);
+        break;
+
+    case SYS_DMA_ALLOC:
+        dispatch_dma_alloc(task, frame);
+        break;
+
+    case SYS_FRAME_PHYS_ADDR:
+        dispatch_frame_phys_addr(task, frame);
+        break;
+
+    case SYS_FBCON_RELEASE:
+        fbcon_release();
+        frame->rax = SYS_OK;
+        break;
+
+    case SYS_PCI_CLAIM_BAR:
+        dispatch_pci_claim_bar(task, frame);
+        break;
+
+    case SYS_PCI_ALLOC_MSI:
+        dispatch_pci_alloc_msi(task, frame);
         break;
 
     default:

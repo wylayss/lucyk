@@ -2,6 +2,7 @@
 #include <cpu.h>
 #include <idt.h>
 #include <ioapic.h>
+#include <io/pci.h>
 #include <io.h>
 #include <ipc.h>
 #include <isr.h>
@@ -807,6 +808,14 @@ static void irq_object_release(mk_object_t *object)
         irq_cap_vectors_used &=
             ~(1U << (irq->vector - IRQ_CAP_VECTOR_FIRST));
         spin_unlock_irqrestore(&irq_binding_lock, flags);
+    } else if (irq->vector != 0) {
+        /* MSI/MSI-X (non-GSI) vector: disable on device + release to pool. */
+        if (irq->msi) {
+            pci_msi_disable((uint8_t)((irq->msi_bdf >> 16) & 0xFFU),
+                            (uint8_t)((irq->msi_bdf >> 8) & 0xFFU),
+                            (uint8_t)(irq->msi_bdf & 0xFFU));
+        }
+        ioapic_free_msi_vector(irq->vector);
     }
     kfree(irq);
 }

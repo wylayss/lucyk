@@ -67,6 +67,8 @@ typedef struct cap_irq_object {
     bool        bound;        /* A notification is attached */
     bool        awaiting_ack; /* Fired and masked; waiting for irq_cap_ack */
     uint64_t    fire_count;   /* Deliveries observed (diagnostics) */
+    bool        msi;          /* PCI MSI/MSI-X programmed for this vector */
+    uint32_t    msi_bdf;      /* bus<<16|slot<<8|func for PCI disable */
 } cap_irq_object_t;
 
 mk_object_t *cap_irq_object_create(uint8_t vector);

@@ -257,6 +257,12 @@ BSD processes may also issue native microkernel syscalls (bit 63 set) such as
 `SYS_THREAD_SET_QOS`, `SYS_TASK_ID`, `SYS_CAP_GRANT` and `SYS_VSPACE_MAP`; those return
 `sys_status_t` codes, not errno values ([`SYSCALL_ABI.md`](SYSCALL_ABI.md)).
 
+**Stage F native syscalls** (bit 63, [`SYSCALL_ABI.md`](SYSCALL_ABI.md)): `SYS_DMA_ALLOC`
+(`CAP_FRAME_DMA`, contiguous, `PTE_NX`, 256-page cap), `SYS_FRAME_PHYS_ADDR` (DMA-only
+physical base), `SYS_PCI_CLAIM_BAR`, `SYS_PCI_ALLOC_MSI` (`CAP_OBJ_IRQ`, MSI/MSI-X, LAPIC
+`0x50..0x6F`, `CAP_OBJ_HARDWARE`/PID-1 privileged), `SYS_FBCON_RELEASE`. AHCI SATA `ext2`
+mounting is in [`ARCHITECTURE.md`](ARCHITECTURE.md); `make run-ahci`.
+
 ## 6. User Pointer Marshalling Rules
 
 Every syscall accepting a user-space pointer (`buf`, `path`, `st`, `argv`, `envp`) MUST:

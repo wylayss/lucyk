@@ -16,6 +16,16 @@ uint64_t pmm_alloc_frame(void);
  * The kernel heap deliberately uses single non-contiguous frames. */
 uint64_t pmm_alloc_frames(size_t count);
 
+/* Maximum pages returned by pmm_alloc_contiguous (256 pages = 1 MiB). */
+#define PMM_CONTIGUOUS_MAX_PAGES 256U
+
+/* Physically contiguous zeroed run of page_count pages, or 0. page_count is
+ * capped at PMM_CONTIGUOUS_MAX_PAGES. The caller owns every frame. */
+uint64_t pmm_alloc_contiguous(size_t page_count);
+
+/* Releases page_count pages starting at page-aligned phys. */
+void pmm_free_contiguous(uintptr_t phys, size_t page_count);
+
 /* Reserved low page (0x8000) holding the AP bootstrap trampoline. */
 uint64_t pmm_ap_trampoline_page(void);
 

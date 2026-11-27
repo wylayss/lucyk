@@ -8,6 +8,8 @@
 #include <io.h>
 #include <io/blkdev.h>
 #include <io/pci.h>
+#include <io/fbcon.h>
+#include <io/ahci.h>
 #include <ioapic.h>
 #include <ipc.h>
 #include <kalloc.h>
@@ -3050,9 +3052,26 @@ static void publish_boot_display(void)
         kpanic("display: boot capability registration failed");
     }
 
+    /* Privileged hardware-control authority for PID 1. */
+    mk_object_t *hw_object = cap_hardware_object_create();
+    if (hw_object != NULL) {
+        cap_t hw_handle = CAP_NULL;
+        (void)cap_boot_register(CAP_OBJ_HARDWARE, hw_object, CAP_RIGHT_ALL,
+                                &hw_handle);
+        mk_object_release(hw_object);
+    }
+
+
     /* The boot registry holds the references from here on. */
     mk_object_release(fb_object);
     mk_object_release(info_object);
+
+    /* Kernel framebuffer text console: mirror klog + /dev/console onto the
+     * linear framebuffer alongside COM1. Stops at fbcon_release(). */
+    fbcon_init((void *)(uintptr_t)fb->address, (uint32_t)fb->width,
+               (uint32_t)fb->height, (uint32_t)fb->pitch, (uint32_t)fb->bpp,
+               fb->red_mask_size, fb->red_mask_shift, fb->green_mask_size,
+               fb->green_mask_shift, fb->blue_mask_size, fb->blue_mask_shift);
 
     klog(KLOG_INFO,
          "display: %lux%lu %lubpp pitch %lu at 0x%lx (%lu KiB, %s) -> boot caps "
@@ -3208,6 +3227,7 @@ static void selftest_entry(void *arg)
     publish_boot_display();
 
     collect_bsd_boot_modules();
+    ahci_init();
     bsd_init(bsd_boot_modules, bsd_boot_module_count);
 
     thread_exit();

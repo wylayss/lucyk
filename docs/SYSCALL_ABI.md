@@ -64,6 +64,11 @@ Bit `63` of `rax` cleanly partitions native **Microkernel Traps** from **Persona
 | `SYS_IRQ_BIND` | `0x8000000000000050` | `(cap_t irq, cap_t ntf, uint64_t bit)` | Attach a notification to a `CAP_OBJ_IRQ` (both need `CAP_RIGHT_WRITE`, `bit != 0`); unmasks a GSI-backed line |
 | `SYS_IRQ_ACK` | `0x8000000000000051` | `(cap_t irq)` | Re-arm (unmask) a GSI-backed IRQ after its driver serviced the device |
 | `SYS_DEBUG_LOG` | `0x80000000000000F0` | `(const char *buf, size_t len)` | Write a bounded user string (`<= 256` bytes) to the kernel console |
+| `SYS_DMA_ALLOC` | `0x8000000000000060` | `(uint64_t page_count, uint64_t rights)` | Stage F: allocate zeroed contiguous PMM pages (`page_count` cap `SYS_DMA_ALLOC_MAX_PAGES`=256; `rights & ~CAP_RIGHT_ALL`=`SYS_ERR_INVAL`, `READ|WRITE` required) as `CAP_FRAME_DMA`; handle in `rdx`; `SYS_ERR_NOMEM` |
+| `SYS_FRAME_PHYS_ADDR` | `0x8000000000000061` | `(cap_t frame_cap)` | Stage F: physical base in `rdx` **only** for `CAP_FRAME_DMA` (needs `CAP_RIGHT_READ`); `CAP_FRAME_ANON`/`CAP_FRAME_SHARED`/`CAP_FRAME_DEVICE`/invalid -> `SYS_ERR_INVAL` |
+| `SYS_PCI_CLAIM_BAR` | `0x8000000000000062` | `(uint64_t bdf, uint64_t bar_index)` | Stage F (privileged `CAP_OBJ_HARDWARE`, PID 1): validate `bar_index` 0..5 + MMIO (32/64-bit) nonzero BAR, mark claimed (`SYS_ERR_BUSY` on duplicate), enable `PCI_COMMAND_MEMORY\|PCI_COMMAND_BUS_MASTER`, page-round, wrap `CAP_FRAME_DEVICE` (`PTE_DEVICE\|PTE_NX`, never PMM-freed); handle `rdx`, sub-page offset `r8`. `bdf=(bus<<16)\|(slot<<8)\|func`. `SYS_ERR_CAP_RIGHTS` if unprivileged |
+| `SYS_PCI_ALLOC_MSI` | `0x8000000000000063` | `(uint64_t bdf, cap_t irq_cap)` | Stage F (privileged `CAP_OBJ_HARDWARE`): `irq_cap` `CAP_OBJ_IRQ`+`CAP_RIGHT_WRITE`; allocate LAPIC vector `0x50..0x6F`, program PCI MSI/MSI-X (`0xFEE00000\|(bsp_apic_id<<12)`, vector), enable MSI/MSI-X + bus-master, bind vector to `irq_cap`; `SYS_ERR_NOSYS` if no MSI/MSI-X, `SYS_ERR_NOMEM` no vector, `SYS_ERR_CAP_RIGHTS` unprivileged; vector in `rdx` |
+| `SYS_FBCON_RELEASE` | `0x8000000000000064` | `(void)` | Stage F: atomically stop kernel framebuffer text drawing (`fbcon_release`); also triggered when user-space maps the boot framebuffer `CAP_OBJ_FRAME`; `SYS_OK` |
 
 IPC call/receive return the status in `rax`, the badge in `rdx`, and the four message
 words in `rsi`, `r8`, `r9`, and `r10`. `notify_wait` returns the observed bits in
@@ -160,7 +165,8 @@ typedef enum cap_obj_type {
     CAP_OBJ_NOTIFICATION,
     CAP_OBJ_VSPACE,
     CAP_OBJ_IRQ,
-    CAP_OBJ_FRAME
+    CAP_OBJ_FRAME,
+    CAP_OBJ_HARDWARE
 } cap_obj_type_t;
 
 #define CAP_RIGHT_READ   (1ULL << 0)
@@ -182,6 +188,7 @@ while the caller sleeps; the caller releases the retained object with
 | `CAP_FRAME_ANON` | one PMM frame | once; ownership moves to the vspace | frame freed if never mapped |
 | `CAP_FRAME_SHARED` | one PMM frame, object holds a reference | any number of times; each mapping holds its own frame reference | object drops its reference; the frame lives until the last mapping goes |
 | `CAP_FRAME_DEVICE` | page-aligned physical range outside the PMM (MMIO, framebuffer) | any number of times; all pages of the range; always `NX`; write-combining (PAT) or uncached (`PCD`/`PWT`); `VSPACE_PROT_EXEC` is `SYS_ERR_INVAL` | **never** calls `pmm_free_frame()` |
+| `CAP_FRAME_DMA` | contiguous PMM-managed pages (`pmm_alloc_contiguous`, `SYS_DMA_ALLOC`) | any number of times; `NX`, no `EXEC`; per-page PMM refcount + object refcount | every page `pmm_frame_unref`'d; `SYS_FRAME_PHYS_ADDR` allowed only here |
 
 Device leaves carry the software `PTE_DEVICE` bit: unmapping or tearing down a vspace
 never returns them to the PMM, `vspace_clone()` shares them instead of copying,
