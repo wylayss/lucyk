@@ -62,9 +62,10 @@ void tlb_shootdown_service(void);
  * be called with no vspace or PMM lock held. */
 void tlb_shootdown_mask(uint64_t cpu_mask, vaddr_t vaddr);
 
-/* Captures the current kernel page tables, enables NXE and CR0.WP, and
+/* Captures the current kernel page tables, enables NXE and CR0.WP,
  * pre-allocates a PDPT for every kernel PML4 slot (256..511) so later kernel
- * mappings are shared by every vspace. */
+ * mappings are shared by every vspace, and maps the ACPI RECLAIMABLE/NVS
+ * memory-map regions into the HHDM as reserved RW/NX data pages. */
 void vspace_init(void);
 
 /* Allocates a zeroed PML4 and shares the kernel upper half (PML4[256..511]). */

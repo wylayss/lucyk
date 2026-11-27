@@ -47,7 +47,7 @@ volatile struct limine_hhdm_request hhdm_request = {
 };
 
 __attribute__((used, section(".limine_requests")))
-static volatile struct limine_memmap_request memmap_request = {
+volatile struct limine_memmap_request memmap_request = {
     .id = LIMINE_MEMMAP_REQUEST,
     .revision = 0,
     .response = NULL,
